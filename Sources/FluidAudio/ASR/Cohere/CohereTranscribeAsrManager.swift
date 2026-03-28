@@ -40,6 +40,10 @@ public actor CohereTranscribeAsrManager {
             windowSamples: models.manifest.maxAudioSamples,
             overlapSamples: overlapSamples
         )
+        let startedAt = Date()
+        self.logger.info(
+            "Cohere transcribe start [samples=\(audioSamples.count), decoderMode=\(decoderMode.rawValue, privacy: .public), chunks=\(starts.count), overlapSamples=\(overlapSamples)]"
+        )
 
         var chunkTexts: [String] = []
         chunkTexts.reserveCapacity(starts.count)
@@ -58,10 +62,17 @@ public actor CohereTranscribeAsrManager {
                 maxNewTokens: maxNewTokens
             )
             let text = self.decodeTokens(tokenIDs, manifest: models.manifest)
+            self.logger.debug(
+                "Cohere chunk \(chunkIndex + 1)/\(starts.count) finished [tokenCount=\(tokenIDs.count), charCount=\(text.count)]"
+            )
             chunkTexts.append(text)
         }
 
-        return self.mergeTranscriptChunks(chunkTexts)
+        let merged = self.mergeTranscriptChunks(chunkTexts)
+        self.logger.info(
+            "Cohere transcribe finished in \(Date().timeIntervalSince(startedAt), format: .fixed(precision: 2))s [chars=\(merged.count)]"
+        )
+        return merged
     }
 
     public func transcribe(

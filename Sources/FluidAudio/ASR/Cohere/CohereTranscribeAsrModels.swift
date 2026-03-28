@@ -142,6 +142,9 @@ public struct CohereTranscribeAsrModels: Sendable {
         computeUnits: MLComputeUnits = .cpuAndGPU
     ) async throws -> CohereTranscribeAsrModels {
         let manifest = try self.loadManifest(from: directory)
+        cohereLogger.info(
+            "Loading Cohere manifest [modelID=\(manifest.modelID, privacy: .public), sampleRate=\(manifest.sampleRate), decoderMaxLen=\(manifest.decoderMaxLen), hasCachedDecoder=\(manifest.decoderCached != nil)]"
+        )
 
         let configuration = MLModelConfiguration()
         configuration.computeUnits = computeUnits
@@ -236,6 +239,9 @@ public struct CohereTranscribeAsrModels: Sendable {
             cacheRoot: compiledRootDirectory,
             computeUnits: computeUnits
         )
+        cohereLogger.info(
+            "Loading Cohere package \(packageName, privacy: .public) from compiled cache \(compiledURL.path, privacy: .public)"
+        )
         return try await MLModel.load(contentsOf: compiledURL, configuration: configuration)
     }
 
@@ -254,6 +260,7 @@ public struct CohereTranscribeAsrModels: Sendable {
         let compiledURL = cacheRoot.appendingPathComponent(compiledName, isDirectory: true)
 
         if fileManager.fileExists(atPath: compiledURL.path) {
+            cohereLogger.debug("Reusing compiled Cohere model at \(compiledURL.path, privacy: .public)")
             return compiledURL
         }
 
@@ -276,7 +283,7 @@ public struct CohereTranscribeAsrModels: Sendable {
             return compiledURL
         }
 
-        cohereLogger.info("Compiling \(packageURL.lastPathComponent, privacy: .public)")
+        cohereLogger.info("Compiling Cohere package \(packageURL.lastPathComponent, privacy: .public) into \(compiledURL.path, privacy: .public)")
         let tempCompiledURL = try MLModel.compileModel(at: packageURL)
         let stagedURL = cacheRoot.appendingPathComponent("\(compiledName).staging.\(UUID().uuidString)", isDirectory: true)
         try? fileManager.removeItem(at: stagedURL)
@@ -290,6 +297,7 @@ public struct CohereTranscribeAsrModels: Sendable {
 
         try fileManager.moveItem(at: stagedURL, to: compiledURL)
         try? fileManager.removeItem(at: tempCompiledURL)
+        cohereLogger.info("Compiled Cohere package ready at \(compiledURL.path, privacy: .public)")
         return compiledURL
     }
 
