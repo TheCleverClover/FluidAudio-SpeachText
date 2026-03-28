@@ -41,8 +41,9 @@ public actor CohereTranscribeAsrManager {
             overlapSamples: overlapSamples
         )
         let startedAt = Date()
+        let audioSeconds = Double(audioSamples.count) / Double(models.manifest.sampleRate)
         self.logger.info(
-            "Cohere transcribe start [samples=\(audioSamples.count), decoderMode=\(decoderMode.rawValue, privacy: .public), chunks=\(starts.count), overlapSamples=\(overlapSamples)]"
+            "Cohere transcribe start [samples=\(audioSamples.count), audioSeconds=\(audioSeconds, format: .fixed(precision: 2)), decoderMode=\(decoderMode.rawValue, privacy: .public), chunks=\(starts.count), overlapSamples=\(overlapSamples)]"
         )
 
         var chunkTexts: [String] = []
@@ -69,8 +70,10 @@ public actor CohereTranscribeAsrManager {
         }
 
         let merged = self.mergeTranscriptChunks(chunkTexts)
+        let elapsed = Date().timeIntervalSince(startedAt)
+        let rtf = audioSeconds > 0 ? elapsed / audioSeconds : 0
         self.logger.info(
-            "Cohere transcribe finished in \(Date().timeIntervalSince(startedAt), format: .fixed(precision: 2))s [chars=\(merged.count)]"
+            "Cohere transcribe finished in \(elapsed, format: .fixed(precision: 2))s [audioSeconds=\(audioSeconds, format: .fixed(precision: 2)), rtf=\(rtf, format: .fixed(precision: 2))x, chars=\(merged.count)]"
         )
         return merged
     }
