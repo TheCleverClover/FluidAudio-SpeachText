@@ -69,7 +69,7 @@ public actor CohereTranscribeAsrManager {
             chunkTexts.append(text)
         }
 
-        let merged = self.mergeTranscriptChunks(chunkTexts)
+        let merged = CohereChunkMerge.mergeTranscriptChunks(chunkTexts)
         let elapsed = Date().timeIntervalSince(startedAt)
         let rtf = audioSeconds > 0 ? elapsed / audioSeconds : 0
         self.logger.info(
@@ -395,36 +395,6 @@ public actor CohereTranscribeAsrManager {
             starts.append(lastStart)
         }
         return starts
-    }
-
-    private func mergeTranscriptChunks(_ parts: [String]) -> String {
-        guard let first = parts.first else { return "" }
-
-        var accumulator = first
-        for next in parts.dropFirst() {
-            accumulator = self.mergeTwo(accumulator, next)
-        }
-        return accumulator.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func mergeTwo(_ lhs: String, _ rhs: String) -> String {
-        let lhsWords = lhs.split(separator: " ").map(String.init)
-        let rhsWords = rhs.split(separator: " ").map(String.init)
-        if lhsWords.isEmpty { return rhs }
-        if rhsWords.isEmpty { return lhs }
-
-        let maxOverlap = min(lhsWords.count, rhsWords.count, 48)
-        for overlap in stride(from: maxOverlap, through: 1, by: -1) {
-            if Array(lhsWords.suffix(overlap)) == Array(rhsWords.prefix(overlap)) {
-                let remainder = rhsWords.dropFirst(overlap).joined(separator: " ")
-                if remainder.isEmpty {
-                    return lhs
-                }
-                return lhs + " " + remainder
-            }
-        }
-
-        return lhs + " " + rhs
     }
 
     private func decodeTokens(
