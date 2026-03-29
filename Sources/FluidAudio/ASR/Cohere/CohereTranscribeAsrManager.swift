@@ -445,7 +445,7 @@ public actor CohereTranscribeAsrManager {
             var bestValue = pointer[0]
             for index in 1..<count {
                 let current = pointer[index]
-                if Float16(bitPattern: current) > Float16(bitPattern: bestValue) {
+                if self.float32(fromFloat16BitPattern: current) > self.float32(fromFloat16BitPattern: bestValue) {
                     bestValue = current
                     bestIndex = index
                 }
@@ -564,12 +564,74 @@ public actor CohereTranscribeAsrManager {
         let array = try MLMultiArray(shape: shape.map(NSNumber.init), dataType: .float16)
         let pointer = array.dataPointer.bindMemory(to: UInt16.self, capacity: values.count)
         for index in 0..<values.count {
-            var half = Float16(values[index])
-            withUnsafeBytes(of: &half) { bytes in
-                pointer[index] = bytes.load(as: UInt16.self)
-            }
+            pointer[index] = self.float16BitPattern(from: values[index])
         }
         return array
+    }
+
+    private func float32(fromFloat16BitPattern bitPattern: UInt16) -> Float {
+        let sign = UInt32(bitPattern & 0x8000) << 16
+        let exponent = Int((bitPattern >> 10) & 0x1F)
+        let fraction = UInt32(bitPattern & 0x03FF)
+
+        let floatBits: UInt32
+        switch exponent {
+        case 0:
+            if fraction == 0 {
+                floatBits = sign
+            } else {
+                var mantissa = fraction
+                var adjustedExponent = -14
+                while (mantissa & 0x0400) == 0 {
+                    mantissa <<= 1
+                    adjustedExponent -= 1
+                }
+                mantissa &= 0x03FF
+                let exponentBits = UInt32(adjustedExponent + 127) << 23
+                let mantissaBits = mantissa << 13
+                floatBits = sign | exponentBits | mantissaBits
+            }
+        case 0x1F:
+            floatBits = sign | 0x7F80_0000 | (fraction << 13)
+        default:
+            let exponentBits = UInt32(exponent - 15 + 127) << 23
+            let mantissaBits = fraction << 13
+            floatBits = sign | exponentBits | mantissaBits
+        }
+
+        return Float(bitPattern: floatBits)
+    }
+
+    private func float16BitPattern(from value: Float) -> UInt16 {
+        let bits = value.bitPattern
+        let sign = UInt16((bits >> 16) & 0x8000)
+        var exponent = Int((bits >> 23) & 0xFF) - 127 + 15
+        var mantissa = bits & 0x007F_FFFF
+
+        if exponent <= 0 {
+            if exponent < -10 {
+                return sign
+            }
+            mantissa |= 0x0080_0000
+            let shift = UInt32(14 - exponent)
+            let rounded = (mantissa >> shift) + ((mantissa >> (shift - 1)) & 1)
+            return sign | UInt16(rounded)
+        }
+
+        if exponent >= 0x1F {
+            return sign | 0x7C00
+        }
+
+        mantissa = mantissa + 0x0000_1000
+        if (mantissa & 0x0080_0000) != 0 {
+            mantissa = 0
+            exponent += 1
+            if exponent >= 0x1F {
+                return sign | 0x7C00
+            }
+        }
+
+        return sign | UInt16(exponent << 10) | UInt16(mantissa >> 13)
     }
 
     private func makeIntArray(shape: [Int], values: [Int32]) throws -> MLMultiArray {
