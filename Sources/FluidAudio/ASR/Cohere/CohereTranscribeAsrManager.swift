@@ -34,25 +34,24 @@ public actor CohereTranscribeAsrManager {
         }
         guard audioSamples.isEmpty == false else { return "" }
 
-        let overlapSamples = self.effectiveOverlapSamples(for: models.manifest)
-        let starts = self.windowStarts(
-            totalSamples: audioSamples.count,
-            windowSamples: models.manifest.maxAudioSamples,
-            overlapSamples: overlapSamples
+        let chunks = CohereAudioChunkPlanner.makeChunks(
+            audioSamples: audioSamples,
+            sampleRate: models.manifest.sampleRate,
+            maxAudioSamples: models.manifest.maxAudioSamples,
+            boundarySearchSeconds: self.boundarySearchSeconds(for: models.manifest)
         )
         let startedAt = Date()
         let audioSeconds = Double(audioSamples.count) / Double(models.manifest.sampleRate)
         self.logger.info(
-            "Cohere transcribe start [samples=\(audioSamples.count), audioSeconds=\(audioSeconds, format: .fixed(precision: 2)), decoderMode=\(decoderMode.rawValue, privacy: .public), chunks=\(starts.count), overlapSamples=\(overlapSamples)]"
+            "Cohere transcribe start [samples=\(audioSamples.count), audioSeconds=\(audioSeconds, format: .fixed(precision: 2)), decoderMode=\(decoderMode.rawValue, privacy: .public), chunks=\(chunks.count), chunking=energy-boundary]"
         )
 
         var chunkTexts: [String] = []
-        chunkTexts.reserveCapacity(starts.count)
+        chunkTexts.reserveCapacity(chunks.count)
 
-        for chunkIndex in 0..<starts.count {
+        for chunkIndex in 0..<chunks.count {
             let frontInputs = try self.buildChunkInputs(
-                chunkIndex: chunkIndex,
-                starts: starts,
+                chunk: chunks[chunkIndex],
                 audioSamples: audioSamples,
                 manifest: models.manifest
             )
@@ -64,12 +63,12 @@ public actor CohereTranscribeAsrManager {
             )
             let text = self.decodeTokens(tokenIDs, manifest: models.manifest)
             self.logger.debug(
-                "Cohere chunk \(chunkIndex + 1)/\(starts.count) finished [tokenCount=\(tokenIDs.count), charCount=\(text.count)]"
+                "Cohere chunk \(chunkIndex + 1)/\(chunks.count) finished [tokenCount=\(tokenIDs.count), charCount=\(text.count), sampleCount=\(chunks[chunkIndex].sampleCount)]"
             )
             chunkTexts.append(text)
         }
 
-        let merged = CohereChunkMerge.mergeTranscriptChunks(chunkTexts)
+        let merged = CohereAudioChunkPlanner.joinChunkTexts(chunkTexts)
         let elapsed = Date().timeIntervalSince(startedAt)
         let rtf = audioSeconds > 0 ? elapsed / audioSeconds : 0
         self.logger.info(
@@ -127,14 +126,11 @@ public actor CohereTranscribeAsrManager {
     }
 
     private func buildChunkInputs(
-        chunkIndex: Int,
-        starts: [Int],
+        chunk: CohereAudioChunkPlanner.Chunk,
         audioSamples: [Float],
         manifest: CohereTranscribeAsrManifest
     ) throws -> MLDictionaryFeatureProvider {
-        let start = starts[chunkIndex]
-        let end = min(start + manifest.maxAudioSamples, audioSamples.count)
-        var segment = Array(audioSamples[start..<end])
+        var segment = Array(audioSamples[chunk.range])
         let rawLength = segment.count
 
         if segment.count < manifest.maxAudioSamples {
@@ -363,40 +359,6 @@ public actor CohereTranscribeAsrManager {
         return generated
     }
 
-    private func effectiveOverlapSamples(for manifest: CohereTranscribeAsrManifest) -> Int {
-        let maxSamples = manifest.maxAudioSamples
-        if maxSamples <= 1 {
-            return 0
-        }
-        if let overlapSamples = manifest.overlapSamples, overlapSamples >= 0 {
-            return min(overlapSamples, maxSamples - 1)
-        }
-        let overlapSeconds = manifest.overlapSeconds ?? 5.0
-        let overlap = Int(round(Double(manifest.sampleRate) * overlapSeconds))
-        return min(max(0, overlap), maxSamples - 1)
-    }
-
-    private func windowStarts(totalSamples: Int, windowSamples: Int, overlapSamples: Int) -> [Int] {
-        guard totalSamples > 0, windowSamples > 0 else { return [] }
-        guard overlapSamples >= 0, overlapSamples < windowSamples else { return [] }
-        if totalSamples <= windowSamples { return [0] }
-
-        let stride = windowSamples - overlapSamples
-        var starts: [Int] = []
-        var currentStart = 0
-
-        while currentStart + windowSamples < totalSamples {
-            starts.append(currentStart)
-            currentStart += stride
-        }
-
-        let lastStart = totalSamples - windowSamples
-        if starts.isEmpty || starts.last != lastStart {
-            starts.append(lastStart)
-        }
-        return starts
-    }
-
     private func decodeTokens(
         _ tokenIDs: [Int32],
         manifest: CohereTranscribeAsrManifest
@@ -424,6 +386,16 @@ public actor CohereTranscribeAsrManager {
         return pieces.joined()
             .replacingOccurrences(of: "▁", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func boundarySearchSeconds(for manifest: CohereTranscribeAsrManifest) -> Double {
+        if let overlapSamples = manifest.overlapSamples, overlapSamples > 0 {
+            return Double(overlapSamples) / Double(manifest.sampleRate)
+        }
+        if let overlapSeconds = manifest.overlapSeconds, overlapSeconds > 0 {
+            return overlapSeconds
+        }
+        return CohereAudioChunkPlanner.defaultBoundarySearchSeconds
     }
 
     private func applyPreemphasis(
