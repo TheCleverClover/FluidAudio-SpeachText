@@ -10,6 +10,17 @@ public enum CohereTranscribeDecoderMode: String, Sendable {
 }
 
 @available(macOS 15, iOS 18, *)
+private struct CohereTranscribeEncoderStageOutput: @unchecked Sendable {
+    let frontMs: Double
+    let encMs: Double
+    let crossKVms: Double
+    let encoderHidden: MLMultiArray
+    let encoderValid: Int
+    let crossK: MLMultiArray?
+    let crossV: MLMultiArray?
+}
+
+@available(macOS 15, iOS 18, *)
 public actor CohereTranscribeAsrManager {
     private var models: CohereTranscribeAsrModels?
     private let logger = Logger(subsystem: "FluidAudio", category: "CohereTranscribeAsrManager")
@@ -20,7 +31,20 @@ public actor CohereTranscribeAsrManager {
         from directory: URL,
         computeUnits: MLComputeUnits = .cpuAndGPU
     ) async throws {
-        self.models = try await CohereTranscribeAsrModels.load(from: directory, computeUnits: computeUnits)
+        try await self.loadModels(
+            from: directory,
+            computeConfiguration: .init(uniform: computeUnits)
+        )
+    }
+
+    public func loadModels(
+        from directory: URL,
+        computeConfiguration: CohereTranscribeComputeConfiguration
+    ) async throws {
+        self.models = try await CohereTranscribeAsrModels.load(
+            from: directory,
+            computeConfiguration: computeConfiguration
+        )
         self.logger.info("Cohere Transcribe CoreML models loaded from \(directory.path, privacy: .public)")
     }
 
@@ -46,26 +70,39 @@ public actor CohereTranscribeAsrManager {
             "Cohere transcribe start [samples=\(audioSamples.count), audioSeconds=\(audioSeconds, format: .fixed(precision: 2)), decoderMode=\(decoderMode.rawValue, privacy: .public), chunks=\(chunks.count), chunking=energy-boundary]"
         )
 
-        var chunkTexts: [String] = []
-        chunkTexts.reserveCapacity(chunks.count)
-
-        for chunkIndex in 0..<chunks.count {
-            let frontInputs = try self.buildChunkInputs(
-                chunk: chunks[chunkIndex],
+        let chunkTexts: [String]
+        if self.shouldUseAsyncOverlap(models: models, decoderMode: decoderMode, chunkCount: chunks.count) {
+            self.logger.info("Cohere async overlap enabled for chunked cached decode.")
+            chunkTexts = try self.transcribeChunksWithAsyncOverlap(
+                chunks: chunks,
                 audioSamples: audioSamples,
-                manifest: models.manifest
-            )
-            let tokenIDs = try self.runPipeline(
-                frontInputs: frontInputs,
                 models: models,
-                decoderMode: decoderMode,
                 maxNewTokens: maxNewTokens
             )
-            let text = self.decodeTokens(tokenIDs, manifest: models.manifest)
-            self.logger.debug(
-                "Cohere chunk \(chunkIndex + 1)/\(chunks.count) finished [tokenCount=\(tokenIDs.count), charCount=\(text.count), sampleCount=\(chunks[chunkIndex].sampleCount)]"
-            )
-            chunkTexts.append(text)
+        } else {
+            var sequentialTexts: [String] = []
+            sequentialTexts.reserveCapacity(chunks.count)
+
+            for chunkIndex in 0..<chunks.count {
+                let frontInputs = try self.buildChunkInputs(
+                    chunk: chunks[chunkIndex],
+                    audioSamples: audioSamples,
+                    manifest: models.manifest
+                )
+                let tokenIDs = try self.runPipeline(
+                    frontInputs: frontInputs,
+                    models: models,
+                    decoderMode: decoderMode,
+                    maxNewTokens: maxNewTokens
+                )
+                let text = self.decodeTokens(tokenIDs, manifest: models.manifest)
+                self.logger.debug(
+                    "Cohere chunk \(chunkIndex + 1)/\(chunks.count) finished [tokenCount=\(tokenIDs.count), charCount=\(text.count), sampleCount=\(chunks[chunkIndex].sampleCount)]"
+                )
+                sequentialTexts.append(text)
+            }
+
+            chunkTexts = sequentialTexts
         }
 
         let merged = CohereAudioChunkPlanner.joinChunkTexts(chunkTexts)
@@ -75,6 +112,92 @@ public actor CohereTranscribeAsrManager {
             "Cohere transcribe finished in \(elapsed, format: .fixed(precision: 2))s [audioSeconds=\(audioSeconds, format: .fixed(precision: 2)), rtf=\(rtf, format: .fixed(precision: 2))x, chars=\(merged.count)]"
         )
         return merged
+    }
+
+    private func shouldUseAsyncOverlap(
+        models: CohereTranscribeAsrModels,
+        decoderMode: CohereTranscribeDecoderMode,
+        chunkCount: Int
+    ) -> Bool {
+        guard chunkCount > 1, decoderMode == .cached else { return false }
+        guard models.computeConfiguration.usesSplitCompute else { return false }
+        guard self.canRunCachedDecoder(with: models) else { return false }
+        guard models.crossKVProjector != nil, models.manifest.crossKVProjector != nil else { return false }
+        return true
+    }
+
+    private func transcribeChunksWithAsyncOverlap(
+        chunks: [CohereAudioChunkPlanner.Chunk],
+        audioSamples: [Float],
+        models: CohereTranscribeAsrModels,
+        maxNewTokens: Int?
+    ) throws -> [String] {
+        final class PrefetchBox: @unchecked Sendable {
+            var result: Result<CohereTranscribeEncoderStageOutput, Error>?
+        }
+
+        var texts: [String] = []
+        texts.reserveCapacity(chunks.count)
+
+        let queue = DispatchQueue(label: "FluidAudio.CohereAsyncOverlap", qos: .userInitiated)
+        let modelsRef = models
+
+        var currentEncoder = try self.runEncoderStage(
+            frontInputs: self.buildChunkInputs(
+                chunk: chunks[0],
+                audioSamples: audioSamples,
+                manifest: models.manifest
+            ),
+            models: models
+        )
+
+        for chunkIndex in 0..<chunks.count {
+            let nextBox: PrefetchBox?
+            let nextGroup: DispatchGroup?
+
+            if chunkIndex + 1 < chunks.count {
+                let frontInputs = try self.buildChunkInputs(
+                    chunk: chunks[chunkIndex + 1],
+                    audioSamples: audioSamples,
+                    manifest: models.manifest
+                )
+                let group = DispatchGroup()
+                let box = PrefetchBox()
+                group.enter()
+                queue.async {
+                    defer { group.leave() }
+                    box.result = Result {
+                        try self.runEncoderStage(frontInputs: frontInputs, models: modelsRef)
+                    }
+                }
+                nextBox = box
+                nextGroup = group
+            } else {
+                nextBox = nil
+                nextGroup = nil
+            }
+
+            let tokenIDs = try self.runCachedDecoderOnly(
+                encoderStage: currentEncoder,
+                models: models,
+                maxNewTokens: maxNewTokens
+            )
+            let text = self.decodeTokens(tokenIDs, manifest: models.manifest)
+            self.logger.debug(
+                "Cohere chunk \(chunkIndex + 1)/\(chunks.count) finished [tokenCount=\(tokenIDs.count), charCount=\(text.count), sampleCount=\(chunks[chunkIndex].sampleCount), frontMs=\(currentEncoder.frontMs, format: .fixed(precision: 1)), encMs=\(currentEncoder.encMs, format: .fixed(precision: 1)), crossKVms=\(currentEncoder.crossKVms, format: .fixed(precision: 1))]"
+            )
+            texts.append(text)
+
+            if let nextGroup, let nextBox {
+                nextGroup.wait()
+                guard let result = nextBox.result else {
+                    throw CohereTranscribeAsrError.generationFailed("Async encoder prefetch produced no result")
+                }
+                currentEncoder = try result.get()
+            }
+        }
+
+        return texts
     }
 
     public func transcribe(
@@ -109,7 +232,7 @@ public actor CohereTranscribeAsrManager {
                 maxNewTokens: maxNewTokens
             )
         case .cached:
-            guard models.manifest.decoderCached != nil, models.cachedDecoder != nil else {
+            guard self.canRunCachedDecoder(with: models) else {
                 self.logger.warning("Cached decoder metadata missing; falling back to full-sequence decode.")
                 return try self.runFullSequencePipeline(
                     frontInputs: frontInputs,
@@ -125,7 +248,14 @@ public actor CohereTranscribeAsrManager {
         }
     }
 
-    private func buildChunkInputs(
+    private func canRunCachedDecoder(with models: CohereTranscribeAsrModels) -> Bool {
+        guard let metadata = models.manifest.decoderCached, models.cachedDecoder != nil else {
+            return false
+        }
+        return metadata.cacheKOutput != nil && metadata.cacheVOutput != nil
+    }
+
+    nonisolated private func buildChunkInputs(
         chunk: CohereAudioChunkPlanner.Chunk,
         audioSamples: [Float],
         manifest: CohereTranscribeAsrManifest
@@ -155,12 +285,14 @@ public actor CohereTranscribeAsrManager {
         ])
     }
 
-    private func runFrontendEncoder(
+    nonisolated private func runEncoderStage(
         frontInputs: MLDictionaryFeatureProvider,
         models: CohereTranscribeAsrModels
-    ) throws -> (encoderHidden: MLMultiArray, encoderValid: Int) {
+    ) throws -> CohereTranscribeEncoderStageOutput {
         let manifest = models.manifest
+        let frontStartedAt = Date()
         let frontOut = try models.frontend.prediction(from: frontInputs)
+        let frontMs = Date().timeIntervalSince(frontStartedAt) * 1000
         guard
             let inputFeatures = frontOut.featureValue(for: manifest.frontend.outputs[0])?.multiArrayValue,
             let featureLength = frontOut.featureValue(for: manifest.frontend.outputs[1])?.multiArrayValue
@@ -172,7 +304,9 @@ public actor CohereTranscribeAsrManager {
             manifest.encoder.inputs[0]: MLFeatureValue(multiArray: inputFeatures),
             manifest.encoder.inputs[1]: MLFeatureValue(multiArray: featureLength),
         ])
+        let encoderStartedAt = Date()
         let encoderOut = try models.encoder.prediction(from: encoderInputs)
+        let encoderMs = Date().timeIntervalSince(encoderStartedAt) * 1000
         guard
             let encoderHidden = encoderOut.featureValue(for: manifest.encoder.outputs[0])?.multiArrayValue,
             let encoderLengthOut = encoderOut.featureValue(for: manifest.encoder.outputs[1])?.multiArrayValue
@@ -183,18 +317,49 @@ public actor CohereTranscribeAsrManager {
         let encoderHiddenContiguous = try self.toContiguous(encoderHidden)
         let encoderValidRaw = Int(encoderLengthOut[0].doubleValue.rounded())
         let encoderValid = max(1, min(manifest.maxEncoderFrames, encoderValidRaw))
-        return (encoderHiddenContiguous, encoderValid)
+
+        var crossK: MLMultiArray?
+        var crossV: MLMultiArray?
+        var crossKVms: Double = 0
+        if
+            let crossKVMeta = manifest.crossKVProjector,
+            let crossKVProjector = models.crossKVProjector
+        {
+            let inputName = crossKVMeta.inputs.first ?? "encoder_hidden_states"
+            let crossKVStartedAt = Date()
+            let crossKVInputs = try MLDictionaryFeatureProvider(dictionary: [
+                inputName: MLFeatureValue(multiArray: encoderHiddenContiguous)
+            ])
+            let crossKVOutput = try crossKVProjector.prediction(from: crossKVInputs)
+            crossKVms = Date().timeIntervalSince(crossKVStartedAt) * 1000
+            if let crossKOutput = crossKVMeta.crossKOutput ?? crossKVMeta.outputs.first {
+                crossK = crossKVOutput.featureValue(for: crossKOutput)?.multiArrayValue
+            }
+            if let crossVOutput = crossKVMeta.crossVOutput ?? crossKVMeta.outputs.dropFirst().first {
+                crossV = crossKVOutput.featureValue(for: crossVOutput)?.multiArrayValue
+            }
+        }
+
+        return CohereTranscribeEncoderStageOutput(
+            frontMs: frontMs,
+            encMs: encoderMs,
+            crossKVms: crossKVms,
+            encoderHidden: encoderHiddenContiguous,
+            encoderValid: encoderValid,
+            crossK: crossK,
+            crossV: crossV
+        )
     }
 
-    private func runFullSequencePipeline(
+    nonisolated private func runFullSequencePipeline(
         frontInputs: MLDictionaryFeatureProvider,
         models: CohereTranscribeAsrModels,
         maxNewTokens: Int?
     ) throws -> [Int32] {
         let manifest = models.manifest
-        let frontendEncoder = try self.runFrontendEncoder(frontInputs: frontInputs, models: models)
-        let encoderHidden = frontendEncoder.encoderHidden
-        let encoderValid = frontendEncoder.encoderValid
+        let encoderStage = try self.runEncoderStage(frontInputs: frontInputs, models: models)
+        let encoderHidden = encoderStage.encoderHidden
+        let encoderValid = encoderStage.encoderValid
 
         let vocabSize = manifest.idToToken.count
         let totalMaxNewTokens = maxNewTokens ?? manifest.defaultMaxNewTokens
@@ -246,23 +411,34 @@ public actor CohereTranscribeAsrManager {
         return Array(inputIDs[0...currentIndex])
     }
 
-    private func runCachedPipeline(
+    nonisolated private func runCachedPipeline(
         frontInputs: MLDictionaryFeatureProvider,
+        models: CohereTranscribeAsrModels,
+        maxNewTokens: Int?
+    ) throws -> [Int32] {
+        let encoderStage = try self.runEncoderStage(frontInputs: frontInputs, models: models)
+        return try self.runCachedDecoderOnly(
+            encoderStage: encoderStage,
+            models: models,
+            maxNewTokens: maxNewTokens
+        )
+    }
+
+    nonisolated private func runCachedDecoderOnly(
+        encoderStage: CohereTranscribeEncoderStageOutput,
         models: CohereTranscribeAsrModels,
         maxNewTokens: Int?
     ) throws -> [Int32] {
         guard
             let cachedMetadata = models.manifest.decoderCached,
-            let cachedDecoder = models.cachedDecoder
+            let cachedDecoder = models.cachedDecoder,
+            let cacheKOutput = cachedMetadata.cacheKOutput,
+            let cacheVOutput = cachedMetadata.cacheVOutput
         else {
             throw CohereTranscribeAsrError.generationFailed("Cached decoder is unavailable")
         }
 
         let manifest = models.manifest
-        let frontendEncoder = try self.runFrontendEncoder(frontInputs: frontInputs, models: models)
-        let encoderHidden = frontendEncoder.encoderHidden
-        let encoderValid = frontendEncoder.encoderValid
-
         let maxTokens = maxNewTokens ?? manifest.defaultMaxNewTokens
         let cacheShape = [cachedMetadata.numLayers, cachedMetadata.numHeads, manifest.decoderMaxLen, cachedMetadata.headDim]
             .map(NSNumber.init)
@@ -282,33 +458,40 @@ public actor CohereTranscribeAsrManager {
         memset(cacheVA.dataPointer, 0, cacheElementCount * cacheBytesPerElement)
 
         let crossAttentionMask = try self.makeCrossAttentionMask(
-            validLength: encoderValid,
+            validLength: encoderStage.encoderValid,
             totalLength: manifest.maxEncoderFrames,
             useFloat16: manifest.isFp16
         )
 
         let inputIDArray = try MLMultiArray(shape: [1, 1], dataType: .int32)
         let stepArray = try MLMultiArray(shape: [1], dataType: .int32)
-        let featureProvider = FastFeatureProvider([
-            (cachedMetadata.inputs[0], encoderHidden),
-            (cachedMetadata.inputs[1], inputIDArray),
-            (cachedMetadata.inputs[2], cacheKA),
-            (cachedMetadata.inputs[3], cacheVA),
-            (cachedMetadata.inputs[4], stepArray),
-            (cachedMetadata.inputs[5], crossAttentionMask),
-        ])
+        let inputIDName = self.cachedDecoderInputName(metadata: cachedMetadata, preferred: "input_id", fallbackIndex: 1)
+        let cacheKInputName = self.cachedDecoderInputName(metadata: cachedMetadata, preferred: "cache_k", fallbackIndex: 2)
+        let cacheVInputName = self.cachedDecoderInputName(metadata: cachedMetadata, preferred: "cache_v", fallbackIndex: 3)
+        let stepInputName = self.cachedDecoderInputName(metadata: cachedMetadata, preferred: "step", fallbackIndex: 4)
+        let crossAttentionMaskName = self.cachedDecoderInputName(metadata: cachedMetadata, preferred: "cross_attention_mask", fallbackIndex: 5)
+
+        let featureProvider = self.makeCachedDecoderFeatureProvider(
+            metadata: cachedMetadata,
+            encoderStage: encoderStage,
+            inputIDArray: inputIDArray,
+            cacheKA: cacheKA,
+            cacheVA: cacheVA,
+            stepArray: stepArray,
+            crossAttentionMask: crossAttentionMask
+        )
 
         let optionsA = MLPredictionOptions()
         optionsA.outputBackings = [
             cachedMetadata.logitsOutput: logitsBuffer,
-            cachedMetadata.cacheKOutput: cacheKB,
-            cachedMetadata.cacheVOutput: cacheVB,
+            cacheKOutput: cacheKB,
+            cacheVOutput: cacheVB,
         ]
         let optionsB = MLPredictionOptions()
         optionsB.outputBackings = [
             cachedMetadata.logitsOutput: logitsBuffer,
-            cachedMetadata.cacheKOutput: cacheKA,
-            cachedMetadata.cacheVOutput: cacheVA,
+            cacheKOutput: cacheKA,
+            cacheVOutput: cacheVA,
         ]
 
         var useA = true
@@ -319,8 +502,11 @@ public actor CohereTranscribeAsrManager {
 
             let inputCacheK = useA ? cacheKA : cacheKB
             let inputCacheV = useA ? cacheVA : cacheVB
-            featureProvider.update(cachedMetadata.inputs[2], inputCacheK)
-            featureProvider.update(cachedMetadata.inputs[3], inputCacheV)
+            featureProvider.update(inputIDName, inputIDArray)
+            featureProvider.update(cacheKInputName, inputCacheK)
+            featureProvider.update(cacheVInputName, inputCacheV)
+            featureProvider.update(stepInputName, stepArray)
+            featureProvider.update(crossAttentionMaskName, crossAttentionMask)
 
             let options = useA ? optionsA : optionsB
             _ = try cachedDecoder.prediction(from: featureProvider, options: options)
@@ -359,7 +545,61 @@ public actor CohereTranscribeAsrManager {
         return generated
     }
 
-    private func decodeTokens(
+    nonisolated private func makeCachedDecoderFeatureProvider(
+        metadata: CohereTranscribeCachedDecoderMeta,
+        encoderStage: CohereTranscribeEncoderStageOutput,
+        inputIDArray: MLMultiArray,
+        cacheKA: MLMultiArray,
+        cacheVA: MLMultiArray,
+        stepArray: MLMultiArray,
+        crossAttentionMask: MLMultiArray
+    ) -> FastFeatureProvider {
+        let inputIDName = self.cachedDecoderInputName(metadata: metadata, preferred: "input_id", fallbackIndex: 1)
+        let cacheKInputName = self.cachedDecoderInputName(metadata: metadata, preferred: "cache_k", fallbackIndex: 2)
+        let cacheVInputName = self.cachedDecoderInputName(metadata: metadata, preferred: "cache_v", fallbackIndex: 3)
+        let stepInputName = self.cachedDecoderInputName(metadata: metadata, preferred: "step", fallbackIndex: 4)
+        let crossAttentionMaskName = self.cachedDecoderInputName(metadata: metadata, preferred: "cross_attention_mask", fallbackIndex: 5)
+
+        if let crossK = encoderStage.crossK, let crossV = encoderStage.crossV {
+            let crossKName = self.cachedDecoderInputName(metadata: metadata, preferred: "cross_k", fallbackIndex: 0)
+            let crossVName = self.cachedDecoderInputName(metadata: metadata, preferred: "cross_v", fallbackIndex: 1)
+            return FastFeatureProvider([
+                (crossKName, crossK),
+                (crossVName, crossV),
+                (inputIDName, inputIDArray),
+                (cacheKInputName, cacheKA),
+                (cacheVInputName, cacheVA),
+                (stepInputName, stepArray),
+                (crossAttentionMaskName, crossAttentionMask),
+            ])
+        }
+
+        let encoderHiddenName = self.cachedDecoderInputName(metadata: metadata, preferred: "encoder_hidden_states", fallbackIndex: 0)
+        return FastFeatureProvider([
+            (encoderHiddenName, encoderStage.encoderHidden),
+            (inputIDName, inputIDArray),
+            (cacheKInputName, cacheKA),
+            (cacheVInputName, cacheVA),
+            (stepInputName, stepArray),
+            (crossAttentionMaskName, crossAttentionMask),
+        ])
+    }
+
+    nonisolated private func cachedDecoderInputName(
+        metadata: CohereTranscribeCachedDecoderMeta,
+        preferred: String,
+        fallbackIndex: Int
+    ) -> String {
+        if metadata.inputs.contains(preferred) {
+            return preferred
+        }
+        if metadata.inputs.indices.contains(fallbackIndex) {
+            return metadata.inputs[fallbackIndex]
+        }
+        return preferred
+    }
+
+    nonisolated private func decodeTokens(
         _ tokenIDs: [Int32],
         manifest: CohereTranscribeAsrManifest
     ) -> String {
@@ -388,7 +628,7 @@ public actor CohereTranscribeAsrManager {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func boundarySearchSeconds(for manifest: CohereTranscribeAsrManifest) -> Double {
+    nonisolated private func boundarySearchSeconds(for manifest: CohereTranscribeAsrManifest) -> Double {
         if let overlapSamples = manifest.overlapSamples, overlapSamples > 0 {
             return Double(overlapSamples) / Double(manifest.sampleRate)
         }
@@ -398,7 +638,7 @@ public actor CohereTranscribeAsrManager {
         return CohereAudioChunkPlanner.defaultBoundarySearchSeconds
     }
 
-    private func applyPreemphasis(
+    nonisolated private func applyPreemphasis(
         _ audio: inout [Float],
         rawLength: Int,
         coefficient: Float
@@ -417,7 +657,7 @@ public actor CohereTranscribeAsrManager {
         }
     }
 
-    private func makeCrossAttentionMask(
+    nonisolated private func makeCrossAttentionMask(
         validLength: Int,
         totalLength: Int,
         useFloat16: Bool
@@ -437,7 +677,7 @@ public actor CohereTranscribeAsrManager {
         return try self.makeFloatArray(shape: [1, 1, 1, totalLength], values: values)
     }
 
-    private func argmax1D(_ array: MLMultiArray) -> Int32 {
+    nonisolated private func argmax1D(_ array: MLMultiArray) -> Int32 {
         let count = array.count
         if array.dataType == .float16 {
             let pointer = array.dataPointer.bindMemory(to: UInt16.self, capacity: count)
@@ -465,7 +705,7 @@ public actor CohereTranscribeAsrManager {
         return Int32(bestIndex)
     }
 
-    private func argmaxSlice(
+    nonisolated private func argmaxSlice(
         _ array: MLMultiArray,
         tokenIndex: Int,
         vocabSize: Int
@@ -487,7 +727,7 @@ public actor CohereTranscribeAsrManager {
         return Int32(bestIndex)
     }
 
-    private func toContiguous(_ array: MLMultiArray) throws -> MLMultiArray {
+    nonisolated private func toContiguous(_ array: MLMultiArray) throws -> MLMultiArray {
         let shape = array.shape.map(\.intValue)
         let totalCount = shape.reduce(1, *)
         let strides = array.strides.map(\.intValue)
@@ -551,7 +791,7 @@ public actor CohereTranscribeAsrManager {
         return contiguous
     }
 
-    private func makeFloatArray(shape: [Int], values: [Float]) throws -> MLMultiArray {
+    nonisolated private func makeFloatArray(shape: [Int], values: [Float]) throws -> MLMultiArray {
         let array = try MLMultiArray(shape: shape.map(NSNumber.init), dataType: .float32)
         let pointer = array.dataPointer.bindMemory(to: Float.self, capacity: values.count)
         _ = values.withUnsafeBufferPointer { buffer in
@@ -560,7 +800,7 @@ public actor CohereTranscribeAsrManager {
         return array
     }
 
-    private func makeFloat16Array(shape: [Int], values: [Float]) throws -> MLMultiArray {
+    nonisolated private func makeFloat16Array(shape: [Int], values: [Float]) throws -> MLMultiArray {
         let array = try MLMultiArray(shape: shape.map(NSNumber.init), dataType: .float16)
         let pointer = array.dataPointer.bindMemory(to: UInt16.self, capacity: values.count)
         for index in 0..<values.count {
@@ -569,7 +809,7 @@ public actor CohereTranscribeAsrManager {
         return array
     }
 
-    private func float32(fromFloat16BitPattern bitPattern: UInt16) -> Float {
+    nonisolated private func float32(fromFloat16BitPattern bitPattern: UInt16) -> Float {
         let sign = UInt32(bitPattern & 0x8000) << 16
         let exponent = Int((bitPattern >> 10) & 0x1F)
         let fraction = UInt32(bitPattern & 0x03FF)
@@ -602,7 +842,7 @@ public actor CohereTranscribeAsrManager {
         return Float(bitPattern: floatBits)
     }
 
-    private func float16BitPattern(from value: Float) -> UInt16 {
+    nonisolated private func float16BitPattern(from value: Float) -> UInt16 {
         let bits = value.bitPattern
         let sign = UInt16((bits >> 16) & 0x8000)
         var exponent = Int((bits >> 23) & 0xFF) - 127 + 15
@@ -634,7 +874,7 @@ public actor CohereTranscribeAsrManager {
         return sign | UInt16(exponent << 10) | UInt16(mantissa >> 13)
     }
 
-    private func makeIntArray(shape: [Int], values: [Int32]) throws -> MLMultiArray {
+    nonisolated private func makeIntArray(shape: [Int], values: [Int32]) throws -> MLMultiArray {
         let array = try MLMultiArray(shape: shape.map(NSNumber.init), dataType: .int32)
         let pointer = array.dataPointer.bindMemory(to: Int32.self, capacity: values.count)
         _ = values.withUnsafeBufferPointer { buffer in

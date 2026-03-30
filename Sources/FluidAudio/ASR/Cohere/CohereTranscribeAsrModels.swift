@@ -38,8 +38,8 @@ public struct CohereTranscribeCachedDecoderMeta: Codable, Sendable {
     public let inputs: [String]
     public let outputs: [String]
     public let logitsOutput: String
-    public let cacheKOutput: String
-    public let cacheVOutput: String
+    public let cacheKOutput: String?
+    public let cacheVOutput: String?
     public let numLayers: Int
     public let numHeads: Int
     public let headDim: Int
@@ -54,6 +54,22 @@ public struct CohereTranscribeCachedDecoderMeta: Codable, Sendable {
         case numLayers = "num_layers"
         case numHeads = "num_heads"
         case headDim = "head_dim"
+    }
+}
+
+public struct CohereTranscribeCrossKVMeta: Codable, Sendable {
+    public let package: String
+    public let inputs: [String]
+    public let outputs: [String]
+    public let crossKOutput: String?
+    public let crossVOutput: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case package
+        case inputs
+        case outputs
+        case crossKOutput = "cross_k_output"
+        case crossVOutput = "cross_v_output"
     }
 }
 
@@ -78,6 +94,7 @@ public struct CohereTranscribeAsrManifest: Codable, Sendable {
     public let frontend: CohereTranscribeStageMeta
     public let encoder: CohereTranscribeStageMeta
     public let decoder: CohereTranscribeStageMeta
+    public let crossKVProjector: CohereTranscribeCrossKVMeta?
     public let decoderCached: CohereTranscribeCachedDecoderMeta?
 
     public var isFp16: Bool { self.precision == "float16" }
@@ -103,7 +120,50 @@ public struct CohereTranscribeAsrManifest: Codable, Sendable {
         case frontend
         case encoder
         case decoder
+        case crossKVProjector = "cross_kv_projector"
         case decoderCached = "decoder_cached"
+    }
+}
+
+public struct CohereTranscribeComputeConfiguration: Sendable {
+    public let frontend: MLComputeUnits
+    public let encoder: MLComputeUnits
+    public let crossKV: MLComputeUnits
+    public let decoder: MLComputeUnits
+
+    public init(
+        frontend: MLComputeUnits,
+        encoder: MLComputeUnits,
+        crossKV: MLComputeUnits,
+        decoder: MLComputeUnits
+    ) {
+        self.frontend = frontend
+        self.encoder = encoder
+        self.crossKV = crossKV
+        self.decoder = decoder
+    }
+
+    public init(uniform computeUnits: MLComputeUnits) {
+        self.init(
+            frontend: computeUnits,
+            encoder: computeUnits,
+            crossKV: computeUnits,
+            decoder: computeUnits
+        )
+    }
+
+    public static let sequentialGPU = Self(uniform: .cpuAndGPU)
+    public static let aneSmall = Self(
+        frontend: .cpuAndNeuralEngine,
+        encoder: .cpuAndGPU,
+        crossKV: .cpuAndNeuralEngine,
+        decoder: .cpuAndNeuralEngine
+    )
+
+    public var usesSplitCompute: Bool {
+        self.frontend != self.encoder
+            || self.frontend != self.crossKV
+            || self.frontend != self.decoder
     }
 }
 
@@ -114,8 +174,10 @@ public struct CohereTranscribeAsrModels: Sendable {
     public let frontend: MLModel
     public let encoder: MLModel
     public let decoder: MLModel
+    public let crossKVProjector: MLModel?
     public let cachedDecoder: MLModel?
     public let manifest: CohereTranscribeAsrManifest
+    public let computeConfiguration: CohereTranscribeComputeConfiguration
 
     public static func modelsExist(at directory: URL) -> Bool {
         guard let manifest = try? self.loadManifest(from: directory) else {
@@ -128,6 +190,7 @@ public struct CohereTranscribeAsrModels: Sendable {
             manifest.frontend.package,
             manifest.encoder.package,
             manifest.decoder.package,
+            manifest.crossKVProjector?.package,
             manifest.decoderCached?.package,
         ]
             .compactMap { $0 }
@@ -141,41 +204,54 @@ public struct CohereTranscribeAsrModels: Sendable {
         from directory: URL,
         computeUnits: MLComputeUnits = .cpuAndGPU
     ) async throws -> CohereTranscribeAsrModels {
+        try await self.load(
+            from: directory,
+            computeConfiguration: .init(uniform: computeUnits)
+        )
+    }
+
+    public static func load(
+        from directory: URL,
+        computeConfiguration: CohereTranscribeComputeConfiguration
+    ) async throws -> CohereTranscribeAsrModels {
         let manifest = try self.loadManifest(from: directory)
         cohereLogger.info(
-            "Loading Cohere manifest [modelID=\(manifest.modelID, privacy: .public), sampleRate=\(manifest.sampleRate), decoderMaxLen=\(manifest.decoderMaxLen), hasCachedDecoder=\(manifest.decoderCached != nil)]"
+            "Loading Cohere manifest [modelID=\(manifest.modelID, privacy: .public), sampleRate=\(manifest.sampleRate), decoderMaxLen=\(manifest.decoderMaxLen), hasCachedDecoder=\(manifest.decoderCached != nil), hasCrossKV=\(manifest.crossKVProjector != nil)]"
         )
-
-        let configuration = MLModelConfiguration()
-        configuration.computeUnits = computeUnits
-        configuration.allowLowPrecisionAccumulationOnGPU = true
 
         async let frontend = self.loadPackage(
             named: manifest.frontend.package,
             from: directory,
-            configuration: configuration,
-            computeUnits: computeUnits
+            computeUnits: computeConfiguration.frontend
         )
         async let encoder = self.loadPackage(
             named: manifest.encoder.package,
             from: directory,
-            configuration: configuration,
-            computeUnits: computeUnits
+            computeUnits: computeConfiguration.encoder
         )
         async let decoder = self.loadPackage(
             named: manifest.decoder.package,
             from: directory,
-            configuration: configuration,
-            computeUnits: computeUnits
+            computeUnits: computeConfiguration.decoder
         )
+
+        let crossKVProjector: MLModel?
+        if let crossKVMeta = manifest.crossKVProjector {
+            crossKVProjector = try await self.loadPackage(
+                named: crossKVMeta.package,
+                from: directory,
+                computeUnits: computeConfiguration.crossKV
+            )
+        } else {
+            crossKVProjector = nil
+        }
 
         let cachedDecoder: MLModel?
         if let cached = manifest.decoderCached {
             cachedDecoder = try await self.loadPackage(
                 named: cached.package,
                 from: directory,
-                configuration: configuration,
-                computeUnits: computeUnits
+                computeUnits: computeConfiguration.decoder
             )
         } else {
             cachedDecoder = nil
@@ -185,8 +261,10 @@ public struct CohereTranscribeAsrModels: Sendable {
             frontend: frontend,
             encoder: encoder,
             decoder: decoder,
+            crossKVProjector: crossKVProjector,
             cachedDecoder: cachedDecoder,
-            manifest: manifest
+            manifest: manifest,
+            computeConfiguration: computeConfiguration
         )
     }
 
@@ -205,6 +283,7 @@ public struct CohereTranscribeAsrModels: Sendable {
         "cohere_frontend.mlpackage",
         "cohere_encoder.mlpackage",
         "cohere_decoder_fullseq_masked.mlpackage",
+        "cohere_cross_kv_projector.mlpackage",
         "cohere_decoder_cached.mlpackage",
     ]
 
@@ -225,13 +304,16 @@ public struct CohereTranscribeAsrModels: Sendable {
     private static func loadPackage(
         named packageName: String,
         from directory: URL,
-        configuration: MLModelConfiguration,
         computeUnits: MLComputeUnits
     ) async throws -> MLModel {
         let packageURL = directory.appendingPathComponent(packageName)
         guard FileManager.default.fileExists(atPath: packageURL.path) else {
             throw CohereTranscribeAsrError.modelNotFound(packageName)
         }
+
+        let configuration = MLModelConfiguration()
+        configuration.computeUnits = computeUnits
+        configuration.allowLowPrecisionAccumulationOnGPU = true
 
         let compiledRootDirectory = self.compiledArtifactsDirectory(for: directory)
         let compiledURL = try self.compiledModelURL(
