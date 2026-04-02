@@ -51,7 +51,8 @@ public actor CohereTranscribeAsrManager {
     public func transcribe(
         audioSamples: [Float],
         decoderMode: CohereTranscribeDecoderMode = .cached,
-        maxNewTokens: Int? = nil
+        maxNewTokens: Int? = nil,
+        promptIDs: [Int]? = nil
     ) async throws -> String {
         guard let models else {
             throw CohereTranscribeAsrError.generationFailed("Models not loaded")
@@ -77,7 +78,8 @@ public actor CohereTranscribeAsrManager {
                 chunks: chunks,
                 audioSamples: audioSamples,
                 models: models,
-                maxNewTokens: maxNewTokens
+                maxNewTokens: maxNewTokens,
+                promptIDs: promptIDs
             )
         } else {
             var sequentialTexts: [String] = []
@@ -93,7 +95,8 @@ public actor CohereTranscribeAsrManager {
                     frontInputs: frontInputs,
                     models: models,
                     decoderMode: decoderMode,
-                    maxNewTokens: maxNewTokens
+                    maxNewTokens: maxNewTokens,
+                    promptIDs: promptIDs
                 )
                 let text = self.decodeTokens(tokenIDs, manifest: models.manifest)
                 self.logger.debug(
@@ -130,7 +133,8 @@ public actor CohereTranscribeAsrManager {
         chunks: [CohereAudioChunkPlanner.Chunk],
         audioSamples: [Float],
         models: CohereTranscribeAsrModels,
-        maxNewTokens: Int?
+        maxNewTokens: Int?,
+        promptIDs: [Int]?
     ) throws -> [String] {
         final class PrefetchBox: @unchecked Sendable {
             var result: Result<CohereTranscribeEncoderStageOutput, Error>?
@@ -180,7 +184,8 @@ public actor CohereTranscribeAsrManager {
             let tokenIDs = try self.runCachedDecoderOnly(
                 encoderStage: currentEncoder,
                 models: models,
-                maxNewTokens: maxNewTokens
+                maxNewTokens: maxNewTokens,
+                promptIDs: promptIDs
             )
             let text = self.decodeTokens(tokenIDs, manifest: models.manifest)
             self.logger.debug(
@@ -203,7 +208,8 @@ public actor CohereTranscribeAsrManager {
     public func transcribe(
         audioFileAt url: URL,
         decoderMode: CohereTranscribeDecoderMode = .cached,
-        maxNewTokens: Int? = nil
+        maxNewTokens: Int? = nil,
+        promptIDs: [Int]? = nil
     ) async throws -> String {
         guard let models else {
             throw CohereTranscribeAsrError.generationFailed("Models not loaded")
@@ -214,7 +220,8 @@ public actor CohereTranscribeAsrManager {
         return try await self.transcribe(
             audioSamples: audioSamples,
             decoderMode: decoderMode,
-            maxNewTokens: maxNewTokens
+            maxNewTokens: maxNewTokens,
+            promptIDs: promptIDs
         )
     }
 
@@ -222,14 +229,16 @@ public actor CohereTranscribeAsrManager {
         frontInputs: MLDictionaryFeatureProvider,
         models: CohereTranscribeAsrModels,
         decoderMode: CohereTranscribeDecoderMode,
-        maxNewTokens: Int?
+        maxNewTokens: Int?,
+        promptIDs: [Int]?
     ) throws -> [Int32] {
         switch decoderMode {
         case .fullSequence:
             return try self.runFullSequencePipeline(
                 frontInputs: frontInputs,
                 models: models,
-                maxNewTokens: maxNewTokens
+                maxNewTokens: maxNewTokens,
+                promptIDs: promptIDs
             )
         case .cached:
             guard self.canRunCachedDecoder(with: models) else {
@@ -237,13 +246,15 @@ public actor CohereTranscribeAsrManager {
                 return try self.runFullSequencePipeline(
                     frontInputs: frontInputs,
                     models: models,
-                    maxNewTokens: maxNewTokens
+                    maxNewTokens: maxNewTokens,
+                    promptIDs: promptIDs
                 )
             }
             return try self.runCachedPipeline(
                 frontInputs: frontInputs,
                 models: models,
-                maxNewTokens: maxNewTokens
+                maxNewTokens: maxNewTokens,
+                promptIDs: promptIDs
             )
         }
     }
@@ -354,12 +365,14 @@ public actor CohereTranscribeAsrManager {
     nonisolated private func runFullSequencePipeline(
         frontInputs: MLDictionaryFeatureProvider,
         models: CohereTranscribeAsrModels,
-        maxNewTokens: Int?
+        maxNewTokens: Int?,
+        promptIDs: [Int]?
     ) throws -> [Int32] {
         let manifest = models.manifest
         let encoderStage = try self.runEncoderStage(frontInputs: frontInputs, models: models)
         let encoderHidden = encoderStage.encoderHidden
         let encoderValid = encoderStage.encoderValid
+        let generationPromptIDs = promptIDs ?? manifest.promptIDs
 
         let vocabSize = manifest.idToToken.count
         let totalMaxNewTokens = maxNewTokens ?? manifest.defaultMaxNewTokens
@@ -367,7 +380,7 @@ public actor CohereTranscribeAsrManager {
         var inputIDs = Array(repeating: padToken, count: manifest.decoderMaxLen)
         var attentionMask = Array(repeating: Int32(0), count: manifest.decoderMaxLen)
 
-        for (index, tokenID) in manifest.promptIDs.enumerated() where index < manifest.decoderMaxLen {
+        for (index, tokenID) in generationPromptIDs.enumerated() where index < manifest.decoderMaxLen {
             inputIDs[index] = Int32(tokenID)
             attentionMask[index] = 1
         }
@@ -378,7 +391,7 @@ public actor CohereTranscribeAsrManager {
             useFloat16: manifest.isFp16
         )
 
-        var currentIndex = manifest.promptIDs.count - 1
+        var currentIndex = generationPromptIDs.count - 1
         for _ in 0..<totalMaxNewTokens {
             if currentIndex + 1 >= manifest.decoderMaxLen {
                 break
@@ -414,20 +427,23 @@ public actor CohereTranscribeAsrManager {
     nonisolated private func runCachedPipeline(
         frontInputs: MLDictionaryFeatureProvider,
         models: CohereTranscribeAsrModels,
-        maxNewTokens: Int?
+        maxNewTokens: Int?,
+        promptIDs: [Int]?
     ) throws -> [Int32] {
         let encoderStage = try self.runEncoderStage(frontInputs: frontInputs, models: models)
         return try self.runCachedDecoderOnly(
             encoderStage: encoderStage,
             models: models,
-            maxNewTokens: maxNewTokens
+            maxNewTokens: maxNewTokens,
+            promptIDs: promptIDs
         )
     }
 
     nonisolated private func runCachedDecoderOnly(
         encoderStage: CohereTranscribeEncoderStageOutput,
         models: CohereTranscribeAsrModels,
-        maxNewTokens: Int?
+        maxNewTokens: Int?,
+        promptIDs: [Int]?
     ) throws -> [Int32] {
         guard
             let cachedMetadata = models.manifest.decoderCached,
@@ -439,6 +455,7 @@ public actor CohereTranscribeAsrManager {
         }
 
         let manifest = models.manifest
+        let generationPromptIDs = promptIDs ?? manifest.promptIDs
         let maxTokens = maxNewTokens ?? manifest.defaultMaxNewTokens
         let cacheShape = [cachedMetadata.numLayers, cachedMetadata.numHeads, manifest.decoderMaxLen, cachedMetadata.headDim]
             .map(NSNumber.init)
@@ -514,13 +531,13 @@ public actor CohereTranscribeAsrManager {
             return logitsBuffer
         }
 
-        var generated = manifest.promptIDs.map(Int32.init)
+        var generated = generationPromptIDs.map(Int32.init)
         var lastLogits: MLMultiArray?
-        for (index, tokenID) in manifest.promptIDs.enumerated() {
+        for (index, tokenID) in generationPromptIDs.enumerated() {
             lastLogits = try runStep(tokenID: Int32(tokenID), stepIndex: Int32(index))
         }
 
-        var currentIndex = manifest.promptIDs.count
+        var currentIndex = generationPromptIDs.count
         if let lastLogits {
             let next = self.argmax1D(lastLogits)
             generated.append(next)
