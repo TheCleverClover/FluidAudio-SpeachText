@@ -8,6 +8,7 @@ public enum CohereTranscribeAsrError: LocalizedError {
     case manifestMissing(URL)
     case invalidManifest(URL, Error)
     case modelNotFound(String)
+    case invalidModelContract(String)
     case invalidOutput(String)
     case generationFailed(String)
 
@@ -19,6 +20,8 @@ public enum CohereTranscribeAsrError: LocalizedError {
             return "Failed to decode Cohere manifest at \(url.path): \(error.localizedDescription)"
         case .modelNotFound(let name):
             return "Required Cohere CoreML model not found: \(name)"
+        case .invalidModelContract(let message):
+            return "Invalid Cohere model contract: \(message)"
         case .invalidOutput(let message):
             return "Invalid Cohere model output: \(message)"
         case .generationFailed(let message):
@@ -257,7 +260,7 @@ public struct CohereTranscribeAsrModels: Sendable {
             cachedDecoder = nil
         }
 
-        return try await CohereTranscribeAsrModels(
+        let models = try await CohereTranscribeAsrModels(
             frontend: frontend,
             encoder: encoder,
             decoder: decoder,
@@ -266,6 +269,8 @@ public struct CohereTranscribeAsrModels: Sendable {
             manifest: manifest,
             computeConfiguration: computeConfiguration
         )
+        try self.validateLoadedModelContracts(models)
+        return models
     }
 
     public static func compiledArtifactsDirectory(for sourceDirectory: URL) -> URL {
@@ -325,6 +330,165 @@ public struct CohereTranscribeAsrModels: Sendable {
             "Loading Cohere package \(packageName, privacy: .public) from compiled cache \(compiledURL.path, privacy: .public)"
         )
         return try await MLModel.load(contentsOf: compiledURL, configuration: configuration)
+    }
+
+    private static func validateLoadedModelContracts(_ models: CohereTranscribeAsrModels) throws {
+        let manifest = models.manifest
+
+        try self.validateRequiredFeatureNames(
+            stageName: "frontend",
+            availableInputs: models.frontend.modelDescription.inputDescriptionsByName,
+            expectedInputs: manifest.frontend.inputs,
+            availableOutputs: models.frontend.modelDescription.outputDescriptionsByName,
+            expectedOutputs: manifest.frontend.outputs
+        )
+        try self.validateMultiArrayShape(
+            stageName: "frontend",
+            featureName: manifest.frontend.inputs[0],
+            descriptions: models.frontend.modelDescription.inputDescriptionsByName,
+            expectedShape: [1, manifest.maxAudioSamples]
+        )
+        try self.validateMultiArrayShape(
+            stageName: "frontend",
+            featureName: manifest.frontend.inputs[1],
+            descriptions: models.frontend.modelDescription.inputDescriptionsByName,
+            expectedShape: [1]
+        )
+
+        try self.validateRequiredFeatureNames(
+            stageName: "encoder",
+            availableInputs: models.encoder.modelDescription.inputDescriptionsByName,
+            expectedInputs: manifest.encoder.inputs,
+            availableOutputs: models.encoder.modelDescription.outputDescriptionsByName,
+            expectedOutputs: manifest.encoder.outputs
+        )
+
+        try self.validateRequiredFeatureNames(
+            stageName: "decoder",
+            availableInputs: models.decoder.modelDescription.inputDescriptionsByName,
+            expectedInputs: manifest.decoder.inputs,
+            availableOutputs: models.decoder.modelDescription.outputDescriptionsByName,
+            expectedOutputs: manifest.decoder.outputs
+        )
+        if manifest.decoder.inputs.indices.contains(1) {
+            try self.validateMultiArrayShape(
+                stageName: "decoder",
+                featureName: manifest.decoder.inputs[1],
+                descriptions: models.decoder.modelDescription.inputDescriptionsByName,
+                expectedShape: [1, manifest.decoderMaxLen]
+            )
+        }
+        if manifest.decoder.inputs.indices.contains(2) {
+            try self.validateMultiArrayShape(
+                stageName: "decoder",
+                featureName: manifest.decoder.inputs[2],
+                descriptions: models.decoder.modelDescription.inputDescriptionsByName,
+                expectedShape: [1, manifest.decoderMaxLen]
+            )
+        }
+
+        if let crossKVMeta = manifest.crossKVProjector, let crossKVProjector = models.crossKVProjector {
+            try self.validateRequiredFeatureNames(
+                stageName: "cross-kv projector",
+                availableInputs: crossKVProjector.modelDescription.inputDescriptionsByName,
+                expectedInputs: crossKVMeta.inputs,
+                availableOutputs: crossKVProjector.modelDescription.outputDescriptionsByName,
+                expectedOutputs: crossKVMeta.outputs
+            )
+        }
+
+        if let cachedMeta = manifest.decoderCached, let cachedDecoder = models.cachedDecoder {
+            try self.validateRequiredFeatureNames(
+                stageName: "cached decoder",
+                availableInputs: cachedDecoder.modelDescription.inputDescriptionsByName,
+                expectedInputs: cachedMeta.inputs,
+                availableOutputs: cachedDecoder.modelDescription.outputDescriptionsByName,
+                expectedOutputs: cachedMeta.outputs
+            )
+            try self.validateOutputBackingFeature(
+                stageName: "cached decoder",
+                featureName: cachedMeta.logitsOutput,
+                descriptions: cachedDecoder.modelDescription.outputDescriptionsByName
+            )
+            if let cacheKOutput = cachedMeta.cacheKOutput {
+                try self.validateOutputBackingFeature(
+                    stageName: "cached decoder",
+                    featureName: cacheKOutput,
+                    descriptions: cachedDecoder.modelDescription.outputDescriptionsByName
+                )
+            }
+            if let cacheVOutput = cachedMeta.cacheVOutput {
+                try self.validateOutputBackingFeature(
+                    stageName: "cached decoder",
+                    featureName: cacheVOutput,
+                    descriptions: cachedDecoder.modelDescription.outputDescriptionsByName
+                )
+            }
+        }
+    }
+
+    private static func validateRequiredFeatureNames(
+        stageName: String,
+        availableInputs: [String: MLFeatureDescription],
+        expectedInputs: [String],
+        availableOutputs: [String: MLFeatureDescription],
+        expectedOutputs: [String]
+    ) throws {
+        let missingInputs = expectedInputs.filter { availableInputs[$0] == nil }
+        if missingInputs.isEmpty == false {
+            throw CohereTranscribeAsrError.invalidModelContract(
+                "\(stageName) is missing manifest-declared inputs: \(missingInputs.joined(separator: ", "))"
+            )
+        }
+
+        let missingOutputs = expectedOutputs.filter { availableOutputs[$0] == nil }
+        if missingOutputs.isEmpty == false {
+            throw CohereTranscribeAsrError.invalidModelContract(
+                "\(stageName) is missing manifest-declared outputs: \(missingOutputs.joined(separator: ", "))"
+            )
+        }
+    }
+
+    private static func validateMultiArrayShape(
+        stageName: String,
+        featureName: String,
+        descriptions: [String: MLFeatureDescription],
+        expectedShape: [Int]
+    ) throws {
+        guard let description = descriptions[featureName] else {
+            throw CohereTranscribeAsrError.invalidModelContract(
+                "\(stageName) feature '\(featureName)' is missing from the model description"
+            )
+        }
+        guard let constraint = description.multiArrayConstraint else {
+            throw CohereTranscribeAsrError.invalidModelContract(
+                "\(stageName) feature '\(featureName)' is not a constrained MLMultiArray"
+            )
+        }
+
+        let actualShape = constraint.shape.map(\.intValue)
+        guard actualShape == expectedShape else {
+            throw CohereTranscribeAsrError.invalidModelContract(
+                "\(stageName) feature '\(featureName)' has shape \(actualShape), expected \(expectedShape)"
+            )
+        }
+    }
+
+    private static func validateOutputBackingFeature(
+        stageName: String,
+        featureName: String,
+        descriptions: [String: MLFeatureDescription]
+    ) throws {
+        guard let description = descriptions[featureName] else {
+            throw CohereTranscribeAsrError.invalidModelContract(
+                "\(stageName) output '\(featureName)' is missing from the model description"
+            )
+        }
+        guard description.multiArrayConstraint != nil else {
+            throw CohereTranscribeAsrError.invalidModelContract(
+                "\(stageName) output '\(featureName)' cannot be used with MLMultiArray output backing"
+            )
+        }
     }
 
     private static func compiledModelURL(
