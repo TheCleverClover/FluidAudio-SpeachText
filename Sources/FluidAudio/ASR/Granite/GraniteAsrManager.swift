@@ -142,7 +142,7 @@ public actor GraniteAsrManager {
             )
             let outputs = try runGreedyModel(model: selected.model, meta: selected.meta, window: window)
             let spans = decodeTokenSpans(
-                tokenIDs: outputs.tokenIDs,
+                tokenArray: outputs.tokenArray,
                 bpeLength: outputs.bpeLength,
                 chunk: chunk,
                 manifest: models.manifest
@@ -187,7 +187,7 @@ public actor GraniteAsrManager {
         model: MLModel,
         meta: GraniteWindowMeta,
         window: GraniteFeatureWindow
-    ) throws -> (tokenIDs: [Int32], bpeLength: Int) {
+    ) throws -> (tokenArray: MLMultiArray, bpeLength: Int) {
         let inputName = meta.inputs.first ?? "input_features"
         let maskName = meta.inputs.dropFirst().first ?? "attention_mask"
         let provider = try MLDictionaryFeatureProvider(dictionary: [
@@ -204,16 +204,9 @@ public actor GraniteAsrManager {
             throw GraniteAsrError.invalidOutput("Missing \(backing.lengthOutputName)")
         }
 
-        let tokenCount = tokenArray.count
-        let tokenPtr = tokenArray.dataPointer.bindMemory(to: Int32.self, capacity: tokenCount)
-        var tokenIDs = [Int32](repeating: 0, count: tokenCount)
-        for index in 0 ..< tokenCount {
-            tokenIDs[index] = tokenPtr[index]
-        }
-
         let lengthPtr = lengthArray.dataPointer.bindMemory(to: Int32.self, capacity: lengthArray.count)
         let bpeLength = min(Int(lengthPtr[0]), meta.bpeFrames)
-        return (tokenIDs, max(0, bpeLength))
+        return (tokenArray, max(0, bpeLength))
     }
 
     private func predictionBacking(for meta: GraniteWindowMeta) throws -> GranitePredictionBacking {
@@ -244,14 +237,15 @@ public actor GraniteAsrManager {
     }
 
     private func decodeTokenSpans(
-        tokenIDs: [Int32],
+        tokenArray: MLMultiArray,
         bpeLength: Int,
         chunk: GraniteChunkWindow,
         manifest: GraniteAsrManifest
     ) -> [GraniteTokenSpan] {
         guard bpeLength > 0 else { return [] }
 
-        let limit = min(bpeLength, tokenIDs.count)
+        let limit = min(bpeLength, tokenArray.count)
+        let tokenIDs = tokenArray.dataPointer.bindMemory(to: Int32.self, capacity: tokenArray.count)
         var spans: [GraniteTokenSpan] = []
         var runStart = 0
 
