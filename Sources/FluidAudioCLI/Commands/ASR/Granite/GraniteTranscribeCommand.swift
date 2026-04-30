@@ -6,6 +6,7 @@ import Foundation
 private struct GraniteTranscribeOptions {
     let audioFile: String
     var modelDir: String?
+    var referenceFile: String?
     var mode: GraniteAsrMode = .balanced
     var computeUnits: MLComputeUnits = .cpuAndGPU
 }
@@ -37,6 +38,8 @@ enum GraniteTranscribeCommand {
                 exit(0)
             case "--model-dir":
                 options.modelDir = nextValue(arguments, at: &index, option: "--model-dir")
+            case "--reference":
+                options.referenceFile = nextValue(arguments, at: &index, option: "--reference")
             case "--mode":
                 guard let value = nextValue(arguments, at: &index, option: "--mode"),
                     let parsed = parseMode(value)
@@ -94,13 +97,16 @@ enum GraniteTranscribeCommand {
             logger.info("Audio: \(String(format: "%.2f", duration))s, \(samples.count) samples at 16kHz")
 
             let result = try await manager.transcribeDetailed(audioSamples: samples, mode: options.mode)
-            printResult(result, mode: options.mode)
+            let reference = try options.referenceFile.map { path in
+                try String(contentsOfFile: path, encoding: .utf8)
+            }
+            printResult(result, mode: options.mode, reference: reference)
         } catch {
             logger.error("Granite transcription failed: \(error)")
         }
     }
 
-    private static func printResult(_ result: GraniteTranscriptionResult, mode: GraniteAsrMode) {
+    private static func printResult(_ result: GraniteTranscriptionResult, mode: GraniteAsrMode, reference: String?) {
         let overlap = String(format: "%.1f", result.overlapSeconds)
         let audioDuration = String(format: "%.2f", result.durationSeconds)
         let elapsed = String(format: "%.2f", result.elapsedSeconds)
@@ -120,6 +126,57 @@ enum GraniteTranscribeCommand {
         logger.info("  Processing time: \(elapsed)s")
         logger.info("  RTF: \(rtf)")
         logger.info("  RTFx: \(rtfx)x")
+
+        if let reference {
+            printEvaluation(hypothesis: result.text, reference: reference)
+        }
+    }
+
+    private static func printEvaluation(hypothesis: String, reference: String) {
+        let metrics = calculateReferenceMetrics(hypothesis: hypothesis, reference: reference)
+        logger.info("")
+        logger.info("Evaluation:")
+        logger.info("  WER: \(String(format: "%.2f", metrics.wer * 100))%")
+        logger.info("  CER: \(String(format: "%.2f", metrics.cer * 100))%")
+        let edits = "I \(metrics.insertions), D \(metrics.deletions), S \(metrics.substitutions)"
+        logger.info(
+            "  Edits: \(edits), words \(metrics.referenceWords)"
+        )
+    }
+
+    private static func calculateReferenceMetrics(
+        hypothesis: String,
+        reference: String
+    ) -> GraniteReferenceMetrics {
+        let hypWords = wordTokens(hypothesis)
+        let refWords = wordTokens(reference)
+        let wordDistance = editDistance(hypWords, refWords)
+        let hypCharacters = characterTokens(hypothesis)
+        let refCharacters = characterTokens(reference)
+        let characterDistance = editDistance(hypCharacters, refCharacters)
+
+        return GraniteReferenceMetrics(
+            wer: refWords.isEmpty ? 0.0 : Double(wordDistance.total) / Double(refWords.count),
+            cer: refCharacters.isEmpty ? 0.0 : Double(characterDistance.total) / Double(refCharacters.count),
+            insertions: wordDistance.insertions,
+            deletions: wordDistance.deletions,
+            substitutions: wordDistance.substitutions,
+            referenceWords: refWords.count
+        )
+    }
+
+    private static func wordTokens(_ text: String) -> [String] {
+        text.lowercased()
+            .split { character in
+                !character.isLetter && !character.isNumber
+            }
+            .map(String.init)
+    }
+
+    private static func characterTokens(_ text: String) -> [Character] {
+        text.lowercased().filter { character in
+            character.isLetter || character.isNumber
+        }
     }
 
     private static func parseMode(_ value: String) -> GraniteAsrMode? {
@@ -161,6 +218,7 @@ enum GraniteTranscribeCommand {
             Options:
                 --help, -h                  Show this help message
                 --model-dir <path>          Local Granite NAR CoreML bundle
+                --reference <txt>           Reference transcript; prints WER/CER
                 --mode <balanced|speed|long-speed>
                                             balanced: 35s/5s overlap
                                             speed: 35s for <=5min, then 60s
@@ -173,5 +231,94 @@ enum GraniteTranscribeCommand {
             """
         )
     }
+}
+
+private struct GraniteReferenceMetrics {
+    let wer: Double
+    let cer: Double
+    let insertions: Int
+    let deletions: Int
+    let substitutions: Int
+    let referenceWords: Int
+}
+
+private struct GraniteEditDistance {
+    let total: Int
+    let insertions: Int
+    let deletions: Int
+    let substitutions: Int
+}
+
+private func editDistance<T: Equatable>(_ hypothesis: [T], _ reference: [T]) -> GraniteEditDistance {
+    let hypCount = hypothesis.count
+    let refCount = reference.count
+    if hypCount == 0 {
+        return GraniteEditDistance(total: refCount, insertions: 0, deletions: refCount, substitutions: 0)
+    }
+    if refCount == 0 {
+        return GraniteEditDistance(total: hypCount, insertions: hypCount, deletions: 0, substitutions: 0)
+    }
+
+    var table = Array(repeating: Array(repeating: 0, count: refCount + 1), count: hypCount + 1)
+    for hypIndex in 0 ... hypCount {
+        table[hypIndex][0] = hypIndex
+    }
+    for refIndex in 0 ... refCount {
+        table[0][refIndex] = refIndex
+    }
+
+    for hypIndex in 1 ... hypCount {
+        for refIndex in 1 ... refCount {
+            if hypothesis[hypIndex - 1] == reference[refIndex - 1] {
+                table[hypIndex][refIndex] = table[hypIndex - 1][refIndex - 1]
+            } else {
+                table[hypIndex][refIndex] = 1 + min(
+                    table[hypIndex - 1][refIndex],
+                    min(table[hypIndex][refIndex - 1], table[hypIndex - 1][refIndex - 1])
+                )
+            }
+        }
+    }
+
+    return backtraceEditDistance(table, hypothesis: hypothesis, reference: reference)
+}
+
+private func backtraceEditDistance<T: Equatable>(
+    _ table: [[Int]],
+    hypothesis: [T],
+    reference: [T]
+) -> GraniteEditDistance {
+    var hypIndex = hypothesis.count
+    var refIndex = reference.count
+    var insertions = 0
+    var deletions = 0
+    var substitutions = 0
+
+    while hypIndex > 0 || refIndex > 0 {
+        if hypIndex > 0, refIndex > 0, hypothesis[hypIndex - 1] == reference[refIndex - 1] {
+            hypIndex -= 1
+            refIndex -= 1
+        } else if hypIndex > 0, refIndex > 0,
+                  table[hypIndex][refIndex] == table[hypIndex - 1][refIndex - 1] + 1 {
+            substitutions += 1
+            hypIndex -= 1
+            refIndex -= 1
+        } else if hypIndex > 0, table[hypIndex][refIndex] == table[hypIndex - 1][refIndex] + 1 {
+            insertions += 1
+            hypIndex -= 1
+        } else if refIndex > 0, table[hypIndex][refIndex] == table[hypIndex][refIndex - 1] + 1 {
+            deletions += 1
+            refIndex -= 1
+        } else {
+            break
+        }
+    }
+
+    return GraniteEditDistance(
+        total: table[hypothesis.count][reference.count],
+        insertions: insertions,
+        deletions: deletions,
+        substitutions: substitutions
+    )
 }
 #endif
