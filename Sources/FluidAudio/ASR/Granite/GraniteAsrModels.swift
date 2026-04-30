@@ -107,10 +107,14 @@ public final class GraniteTokenizer {
         }
     }
 
-    public func decode(_ tokenIDs: [Int]) -> String {
-        tokenizer.decode(tokens: tokenIDs, skipSpecialTokens: true)
+    public func encode(_ text: String, addSpecialTokens: Bool = false) -> [Int] {
+        tokenizer.encode(text: text, addSpecialTokens: addSpecialTokens)
+    }
+
+    public func decode(_ tokenIDs: [Int], lowercased: Bool = true) -> String {
+        let text = tokenizer.decode(tokens: tokenIDs, skipSpecialTokens: true)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
+        return lowercased ? text.lowercased() : text
     }
 }
 
