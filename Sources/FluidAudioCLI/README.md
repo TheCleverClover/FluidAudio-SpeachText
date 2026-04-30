@@ -58,7 +58,23 @@ swift run fluidaudiocli transcribe audio.wav --compare
 - `low-latency`: 2.0s chunks, 0.75 confirmation threshold
 - `high-accuracy`: 3.0s chunks, 0.90 confirmation threshold
 
-### 3. `multi-stream` - Parallel Transcription
+### 3. `granite-transcribe` - Granite Speech NAR Transcription
+Transcribe audio files with the Granite Speech NAR CoreML backend.
+
+```bash
+swift run fluidaudiocli granite-transcribe audio.wav --mode balanced --compute-units gpu
+swift run fluidaudiocli granite-transcribe meeting.wav --mode long-speed --reference meeting.txt
+swift run fluidaudiocli granite-transcribe audio.wav --model-dir /path/to/granite-speech-4.1-2b-nar-coreml
+```
+
+**Options:**
+- `--model-dir <path>`: Local Granite bundle; omitted path downloads the default cache bundle
+- `--mode <balanced|speed|long-speed>`: `balanced` uses 35s/5s overlap; `speed` switches to 60s for long files; `long-speed` forces 60s/5s
+- `--compute-units <cpu|gpu|ane|all>`: CoreML compute units, default `gpu`
+- `--reference <txt>`: Print WER/CER against a reference transcript
+- `--help, -h`: Show help message
+
+### 4. `multi-stream` - Parallel Transcription
 Transcribe multiple audio files in parallel using shared ASR models.
 
 ```bash
@@ -76,7 +92,7 @@ swift run fluidaudiocli multi-stream audio1.wav audio2.wav --debug
 - `--debug`: Show debug information
 - `--help, -h`: Show help message
 
-### 4. `diarization-benchmark` - Speaker Diarization Benchmark
+### 5. `diarization-benchmark` - Speaker Diarization Benchmark
 Run comprehensive benchmarks on evaluation datasets.
 
 ```bash
@@ -102,7 +118,7 @@ swift run fluidaudiocli diarization-benchmark --output benchmark_results.json
 - `--output <file>`: Save results to JSON file
 - `--verbose`: Show detailed progress
 
-### 5. `vad-benchmark` - Voice Activity Detection Benchmark
+### 6. `vad-benchmark` - Voice Activity Detection Benchmark
 Benchmark VAD performance on test datasets.
 
 ```bash
@@ -122,7 +138,7 @@ swift run fluidaudiocli vad-benchmark --dataset voices-subset
 - `--dataset <name>`: Dataset to use (e.g., `mini50`, `voices-subset`, `musan-full`)
 - `--debug`: Verbose logging and per-file RTFx
 
-### 6. `asr-benchmark` - ASR Benchmark
+### 7. `asr-benchmark` - ASR Benchmark
 Benchmark ASR performance on LibriSpeech or other datasets.
 
 ```bash
@@ -141,7 +157,7 @@ swift run fluidaudiocli asr-benchmark --verbose
 - `--max-files <n>`: Maximum files to process
 - `--verbose`: Show detailed progress
 
-### 7. `parakeet-eou` - Streaming ASR
+### 8. `parakeet-eou` - Streaming ASR
 Real-time streaming transcription with end-of-utterance detection.
 
 ```bash
@@ -151,7 +167,7 @@ swift run fluidaudiocli parakeet-eou --benchmark --chunk-size 160 --max-files 10
 
 **Options:** `--input <path>`, `--benchmark`, `--max-files <n>`, `--chunk-size <160|320|1600>`, `--eou-debounce <ms>`, `--use-cache`, `--models <path>`, `--output <path>`, `--verbose`
 
-### 8. `download` - Download Datasets
+### 9. `download` - Download Datasets
 
 ```bash
 swift run fluidaudiocli download --dataset ami-sdm
@@ -208,7 +224,10 @@ swift run fluidaudiocli process audio.wav --threshold 0.7
 # 4. Transcribe audio
 swift run fluidaudiocli transcribe audio.wav --config low-latency
 
-# 5. Multi-stream transcription
+# 5. Granite batch transcription
+swift run fluidaudiocli granite-transcribe audio.wav --mode balanced
+
+# 6. Multi-stream transcription
 swift run fluidaudiocli multi-stream mic.wav system.wav
 ```
 

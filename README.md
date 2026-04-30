@@ -35,7 +35,7 @@ Want to convert your own model? Check [möbius](https://github.com/FluidInferenc
 
 ## Highlights
 
-- **Automatic Speech Recognition (ASR)**: Parakeet TDT v3 (0.6b) for batch transcription supporting 25 European languages; Parakeet EOU (120m) for streaming ASR with end-of-utterance detection (English only)
+- **Automatic Speech Recognition (ASR)**: Parakeet TDT v3 (0.6b) for batch transcription supporting 25 European languages; Granite Speech NAR (2B) for fast GPU batch transcription; Parakeet EOU (120m) for streaming ASR with end-of-utterance detection (English only)
 - **Inverse Text Normalization (ITN)**: Post-process ASR output to convert spoken-form to written-form ("two hundred" → "200"). See [text-processing-rs](https://github.com/FluidInference/text-processing-rs)
 - **Text-to-Speech (TTS)**: Kokoro (82m) for parallel synthesis with SSML and pronunciation control across 9 languages (EN, ES, FR, HI, IT, JA, PT, ZH); PocketTTS for streaming TTS with voice cloning support (English only)
 - **Speaker Diarization (Online + Offline)**: Speaker separation and identification across audio streams. Streaming pipeline for real-time processing and offline batch pipeline with advanced clustering.
@@ -260,8 +260,9 @@ claude mcp add -s user -t http deepwiki https://mcp.deepwiki.com/mcp
 - **Models**:
   - `FluidInference/parakeet-tdt-0.6b-v3-coreml` (multilingual, 25 European languages)
   - `FluidInference/parakeet-tdt-0.6b-v2-coreml` (English-only, highest recall)
+  - `FluidInference/granite-speech-4.1-2b-nar-coreml` (fast NAR batch transcription, English/French/German/Spanish/Portuguese)
 - **Processing Mode**: Batch transcription for complete audio files
-- **Real-time Factor**: ~190x on M4 Pro (processes 1 hour of audio in ~19 seconds)
+- **Real-time Factor**: Parakeet reaches ~190x on M4 Pro; Granite NAR validation runs ~44x on M3 Pro with 35s/5s chunking
 - **Streaming Support**: Real-time streaming via `SlidingWindowAsrManager` with sliding window processing and cancellation support
 - **Backend**: Same Parakeet TDT v3 model powers our backend ASR
 
@@ -295,6 +296,25 @@ swift run fluidaudiocli transcribe audio.wav
 
 # English-only run with higher recall
 swift run fluidaudiocli transcribe audio.wav --model-version v2
+
+# Granite Speech NAR batch transcription
+swift run fluidaudiocli granite-transcribe audio.wav --mode balanced --compute-units gpu
+```
+
+### Granite Speech NAR Quick Start
+
+```swift
+import FluidAudio
+
+Task {
+    let manager = GraniteAsrManager()
+    try await manager.loadModels(computeUnits: .cpuAndGPU)
+
+    let url = URL(fileURLWithPath: "meeting.wav")
+    let result = try await manager.transcribeDetailed(audioFileAt: url, mode: .balanced)
+    print("Transcription: \(result.text)")
+    print("RTFx: \(1.0 / result.realTimeFactor)")
+}
 ```
 
 ## Speaker Diarization
