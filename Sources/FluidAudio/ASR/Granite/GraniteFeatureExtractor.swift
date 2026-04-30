@@ -28,6 +28,8 @@ public final class GraniteFeatureExtractor {
     private var imagSq: [Float]
     private var frame: [Float]
     private var melFrame: [Float]
+    private var paddedAudioScratch: [Float]
+    private var logMelScratch: [Float]
 
     public init(modelDirectory: URL, manifest: GraniteAsrManifest) throws {
         self.manifest = manifest
@@ -64,6 +66,8 @@ public final class GraniteFeatureExtractor {
         imagSq = [Float](repeating: 0, count: numFreqBins)
         frame = [Float](repeating: 0, count: manifest.nFFT)
         melFrame = [Float](repeating: 0, count: manifest.nMels)
+        paddedAudioScratch = []
+        logMelScratch = []
     }
 
     deinit {
@@ -86,19 +90,41 @@ public final class GraniteFeatureExtractor {
             throw GraniteAsrError.invalidAudio("Granite audio window is shorter than one encoder frame")
         }
 
-        var logMel = [Float](repeating: 0, count: validMelFrames * manifest.nMels)
+        ensureFloatCapacity(&logMelScratch, count: validMelFrames * manifest.nMels)
         var maxLogMel = -Float.greatestFiniteMagnitude
-        let paddedAudio = makeReflectPaddedAudio(audio)
+        let paddedAudioCount = makeReflectPaddedAudio(audio)
 
         for frameIndex in 0 ..< validMelFrames {
             computeMelFrame(
                 frameIndex: frameIndex,
-                paddedAudio: paddedAudio,
-                logMel: &logMel,
+                paddedAudioCount: paddedAudioCount,
                 maxLogMel: &maxLogMel
             )
         }
 
+        let (features, mask) = try makeInputArrays(
+            windowFrames: windowFrames,
+            validEncoderFrames: validEncoderFrames
+        )
+        fillStackedFeatures(
+            features: features,
+            mask: mask,
+            validEncoderFrames: validEncoderFrames,
+            maxLogMel: maxLogMel
+        )
+
+        return GraniteFeatureWindow(
+            inputFeatures: features,
+            attentionMask: mask,
+            validEncoderFrames: validEncoderFrames,
+            validMelFrames: validMelFrames
+        )
+    }
+
+    private func makeInputArrays(
+        windowFrames: Int,
+        validEncoderFrames: Int
+    ) throws -> (features: MLMultiArray, mask: MLMultiArray) {
         let features = try MLMultiArray(
             shape: [1, NSNumber(value: windowFrames), NSNumber(value: manifest.nMels * 2)],
             dataType: .float32
@@ -109,44 +135,64 @@ public final class GraniteFeatureExtractor {
         )
 
         let featurePtr = features.dataPointer.bindMemory(to: Float.self, capacity: features.count)
-        featurePtr.initialize(repeating: 0, count: features.count)
         let maskPtr = mask.dataPointer.bindMemory(to: Int32.self, capacity: mask.count)
-        maskPtr.initialize(repeating: 0, count: mask.count)
+        let featureStride = manifest.nMels * 2
+        let validFeatureCount = validEncoderFrames * featureStride
+        if validFeatureCount < features.count {
+            for index in validFeatureCount ..< features.count {
+                featurePtr[index] = 0
+            }
+        }
+        if validEncoderFrames < mask.count {
+            for index in validEncoderFrames ..< mask.count {
+                maskPtr[index] = 0
+            }
+        }
+        return (features, mask)
+    }
 
+    private func fillStackedFeatures(
+        features: MLMultiArray,
+        mask: MLMultiArray,
+        validEncoderFrames: Int,
+        maxLogMel: Float
+    ) {
+        let featurePtr = features.dataPointer.bindMemory(to: Float.self, capacity: features.count)
+        let maskPtr = mask.dataPointer.bindMemory(to: Int32.self, capacity: mask.count)
+        let featureStride = manifest.nMels * 2
         let logFloor = maxLogMel - 8.0
         for encoderFrame in 0 ..< validEncoderFrames {
             let firstFrame = encoderFrame * 2
             let secondFrame = firstFrame + 1
-            let dstBase = encoderFrame * manifest.nMels * 2
+            let dstBase = encoderFrame * featureStride
 
             for melIndex in 0 ..< manifest.nMels {
-                let first = logMel[firstFrame * manifest.nMels + melIndex]
-                let second = logMel[secondFrame * manifest.nMels + melIndex]
+                let first = logMelScratch[firstFrame * manifest.nMels + melIndex]
+                let second = logMelScratch[secondFrame * manifest.nMels + melIndex]
                 featurePtr[dstBase + melIndex] = (max(first, logFloor) / 4.0) + 1.0
                 featurePtr[dstBase + manifest.nMels + melIndex] = (max(second, logFloor) / 4.0) + 1.0
             }
             maskPtr[encoderFrame] = 1
         }
-
-        return GraniteFeatureWindow(
-            inputFeatures: features,
-            attentionMask: mask,
-            validEncoderFrames: validEncoderFrames,
-            validMelFrames: validMelFrames
-        )
     }
 
-    private func makeReflectPaddedAudio<C>(_ audio: C) -> [Float] where C: RandomAccessCollection, C.Element == Float {
+    private func ensureFloatCapacity(_ values: inout [Float], count: Int) {
+        if values.count < count {
+            values = [Float](repeating: 0, count: count)
+        }
+    }
+
+    private func makeReflectPaddedAudio<C>(_ audio: C) -> Int where C: RandomAccessCollection, C.Element == Float {
         let pad = manifest.nFFT / 2
         let paddedCount = audio.count + 2 * pad
-        var padded = [Float](repeating: 0, count: paddedCount)
+        ensureFloatCapacity(&paddedAudioScratch, count: paddedCount)
 
         for paddedIndex in 0 ..< paddedCount {
             let sourceOffset = reflectIndex(paddedIndex - pad, count: audio.count)
             let sourceIndex = audio.index(audio.startIndex, offsetBy: sourceOffset)
-            padded[paddedIndex] = audio[sourceIndex]
+            paddedAudioScratch[paddedIndex] = audio[sourceIndex]
         }
-        return padded
+        return paddedCount
     }
 
     private func reflectIndex(_ index: Int, count: Int) -> Int {
@@ -164,16 +210,15 @@ public final class GraniteFeatureExtractor {
 
     private func computeMelFrame(
         frameIndex: Int,
-        paddedAudio: [Float],
-        logMel: inout [Float],
+        paddedAudioCount: Int,
         maxLogMel: inout Float
     ) {
         vDSP_vclr(&frame, 1, vDSP_Length(manifest.nFFT))
         let audioStart = frameIndex * manifest.hopLength + windowOffset
-        let availableSamples = min(manifest.winLength, paddedAudio.count - audioStart)
+        let availableSamples = min(manifest.winLength, paddedAudioCount - audioStart)
 
         if availableSamples > 0 {
-            paddedAudio.withUnsafeBufferPointer { audioPtr in
+            paddedAudioScratch.withUnsafeBufferPointer { audioPtr in
                 hannWindow.withUnsafeBufferPointer { windowPtr in
                     frame.withUnsafeMutableBufferPointer { framePtr in
                         vDSP_vmul(
@@ -206,7 +251,7 @@ public final class GraniteFeatureExtractor {
         let dstBase = frameIndex * manifest.nMels
         for melIndex in 0 ..< manifest.nMels {
             let value = log10f(max(melFrame[melIndex], 1e-10))
-            logMel[dstBase + melIndex] = value
+            logMelScratch[dstBase + melIndex] = value
             maxLogMel = max(maxLogMel, value)
         }
     }

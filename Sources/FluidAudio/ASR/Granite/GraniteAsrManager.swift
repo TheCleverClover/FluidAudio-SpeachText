@@ -40,6 +40,7 @@ public actor GraniteAsrManager {
     private var featureExtractor: GraniteFeatureExtractor?
     private var loadedSpeedModel: MLModel?
     private var computeUnits: MLComputeUnits = .cpuAndGPU
+    private var predictionBackings: [String: GranitePredictionBacking] = [:]
 
     public init() {}
 
@@ -53,6 +54,7 @@ public actor GraniteAsrManager {
         featureExtractor = extractor
         loadedSpeedModel = loadedModels.speedModel
         self.computeUnits = computeUnits
+        predictionBackings.removeAll(keepingCapacity: true)
         graniteAsrLogger.info("Granite NAR ASR models loaded")
     }
 
@@ -192,13 +194,14 @@ public actor GraniteAsrManager {
             inputName: MLFeatureValue(multiArray: window.inputFeatures),
             maskName: MLFeatureValue(multiArray: window.attentionMask)
         ])
+        let backing = try predictionBacking(for: meta)
 
-        let prediction = try model.prediction(from: provider)
-        guard let tokenArray = prediction.featureValue(for: "bpe_token_ids")?.multiArrayValue else {
-            throw GraniteAsrError.invalidOutput("Missing bpe_token_ids")
+        let prediction = try model.prediction(from: provider, options: backing.options)
+        guard let tokenArray = prediction.featureValue(for: backing.tokenOutputName)?.multiArrayValue else {
+            throw GraniteAsrError.invalidOutput("Missing \(backing.tokenOutputName)")
         }
-        guard let lengthArray = prediction.featureValue(for: "bpe_length")?.multiArrayValue else {
-            throw GraniteAsrError.invalidOutput("Missing bpe_length")
+        guard let lengthArray = prediction.featureValue(for: backing.lengthOutputName)?.multiArrayValue else {
+            throw GraniteAsrError.invalidOutput("Missing \(backing.lengthOutputName)")
         }
 
         let tokenCount = tokenArray.count
@@ -211,6 +214,33 @@ public actor GraniteAsrManager {
         let lengthPtr = lengthArray.dataPointer.bindMemory(to: Int32.self, capacity: lengthArray.count)
         let bpeLength = min(Int(lengthPtr[0]), meta.bpeFrames)
         return (tokenIDs, max(0, bpeLength))
+    }
+
+    private func predictionBacking(for meta: GraniteWindowMeta) throws -> GranitePredictionBacking {
+        if let backing = predictionBackings[meta.package] {
+            return backing
+        }
+
+        let tokenOutput = meta.outputs.first ?? "bpe_token_ids"
+        let lengthOutput = meta.outputs.dropFirst().first ?? "bpe_length"
+        let tokenIDs = try MLMultiArray(
+            shape: [1, NSNumber(value: meta.bpeFrames)],
+            dataType: .int32
+        )
+        let length = try MLMultiArray(shape: [1], dataType: .int32)
+        let options = MLPredictionOptions()
+        options.outputBackings = [
+            tokenOutput: tokenIDs,
+            lengthOutput: length
+        ]
+
+        let backing = GranitePredictionBacking(
+            tokenOutputName: tokenOutput,
+            lengthOutputName: lengthOutput,
+            options: options
+        )
+        predictionBackings[meta.package] = backing
+        return backing
     }
 
     private func decodeTokenSpans(
@@ -272,6 +302,13 @@ private struct GraniteChunkWindow: Sendable {
     var durationSeconds: Double {
         Double(endSample - startSample) / Double(sampleRate)
     }
+}
+
+@available(macOS 14, iOS 17, *)
+private struct GranitePredictionBacking {
+    let tokenOutputName: String
+    let lengthOutputName: String
+    let options: MLPredictionOptions
 }
 
 @available(macOS 14, iOS 17, *)
