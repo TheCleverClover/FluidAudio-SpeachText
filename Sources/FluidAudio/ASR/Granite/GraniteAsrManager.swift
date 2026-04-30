@@ -44,20 +44,6 @@ public actor GraniteAsrManager {
 
     public init() {}
 
-    public func loadModels(
-        from directory: URL,
-        computeUnits: MLComputeUnits = .cpuAndGPU
-    ) async throws {
-        let loadedModels = try await GraniteAsrModels.load(from: directory, computeUnits: computeUnits)
-        let extractor = try GraniteFeatureExtractor(modelDirectory: directory, manifest: loadedModels.manifest)
-        models = loadedModels
-        featureExtractor = extractor
-        loadedSpeedModel = loadedModels.speedModel
-        self.computeUnits = computeUnits
-        predictionBackings.removeAll(keepingCapacity: true)
-        graniteAsrLogger.info("Granite NAR ASR models loaded")
-    }
-
     public func transcribe(
         audioSamples: [Float],
         mode: GraniteAsrMode = .balanced
@@ -274,6 +260,68 @@ public actor GraniteAsrManager {
         }
 
         return spans
+    }
+}
+
+@available(macOS 14, iOS 17, *)
+public extension GraniteAsrManager {
+    func loadModels(
+        computeUnits: MLComputeUnits = .cpuAndGPU,
+        loadSpeedModel: Bool = false,
+        progressHandler: DownloadUtils.ProgressHandler? = nil
+    ) async throws {
+        let loadedModels = try await GraniteAsrModels.downloadAndLoad(
+            computeUnits: computeUnits,
+            loadSpeedModel: loadSpeedModel,
+            progressHandler: progressHandler
+        )
+        try initialize(models: loadedModels)
+    }
+
+    func loadModels(
+        from directory: URL,
+        computeUnits: MLComputeUnits = .cpuAndGPU,
+        loadSpeedModel: Bool = false
+    ) async throws {
+        let loadedModels = try await GraniteAsrModels.load(
+            from: directory,
+            computeUnits: computeUnits,
+            loadSpeedModel: loadSpeedModel
+        )
+        try initialize(models: loadedModels)
+    }
+
+    func initialize(models loadedModels: GraniteAsrModels) throws {
+        let extractor = try GraniteFeatureExtractor(
+            modelDirectory: loadedModels.modelDirectory,
+            manifest: loadedModels.manifest
+        )
+        models = loadedModels
+        featureExtractor = extractor
+        loadedSpeedModel = loadedModels.speedModel
+        computeUnits = loadedModels.computeUnits
+        predictionBackings.removeAll(keepingCapacity: true)
+        graniteAsrLogger.info("Granite NAR ASR models loaded")
+    }
+
+    func transcribe(
+        audioFileAt url: URL,
+        mode: GraniteAsrMode = .balanced
+    ) async throws -> String {
+        let result = try await transcribeDetailed(audioFileAt: url, mode: mode)
+        return result.text
+    }
+
+    func transcribeDetailed(
+        audioFileAt url: URL,
+        mode: GraniteAsrMode = .balanced
+    ) async throws -> GraniteTranscriptionResult {
+        guard let models else {
+            throw GraniteAsrError.invalidOutput("Granite models are not loaded")
+        }
+        let audioConverter = AudioConverter(sampleRate: Double(models.manifest.sampleRate))
+        let audioSamples = try audioConverter.resampleAudioFile(url)
+        return try await transcribeDetailed(audioSamples: audioSamples, mode: mode)
     }
 }
 

@@ -123,6 +123,7 @@ public struct GraniteAsrModels {
     public let manifest: GraniteAsrManifest
     public let tokenizer: GraniteTokenizer
     public let modelDirectory: URL
+    public let computeUnits: MLComputeUnits
 
     public static func load(
         from directory: URL,
@@ -165,7 +166,8 @@ public struct GraniteAsrModels {
             speedModel: speedModel,
             manifest: manifest,
             tokenizer: tokenizer,
-            modelDirectory: directory
+            modelDirectory: directory,
+            computeUnits: computeUnits
         )
     }
 
