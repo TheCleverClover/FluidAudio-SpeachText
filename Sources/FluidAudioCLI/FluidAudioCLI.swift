@@ -10,6 +10,7 @@ import MachTaskSelfWrapper
 struct FluidAudioCLI {
     static let cliLogger = AppLogger(category: "Main")
 
+    // swiftlint:disable:next cyclomatic_complexity function_body_length
     static func main() async {
         let arguments = CommandLine.arguments
 
@@ -64,6 +65,8 @@ struct FluidAudioCLI {
             await Qwen3AsrBenchmark.runCLI(arguments: Array(arguments.dropFirst(2)))
         case "qwen3-transcribe":
             await Qwen3TranscribeCommand.run(arguments: Array(arguments.dropFirst(2)))
+        case "granite-transcribe":
+            await GraniteTranscribeCommand.run(arguments: Array(arguments.dropFirst(2)))
         case "g2p-benchmark":
             await G2PBenchmark.run(arguments: Array(arguments.dropFirst(2)))
         case "nemotron-benchmark":
@@ -79,6 +82,7 @@ struct FluidAudioCLI {
         }
     }
 
+    // swiftlint:disable:next function_body_length
     static func printUsage() {
         cliLogger.info(
             """
@@ -104,6 +108,7 @@ struct FluidAudioCLI {
                 lseend-benchmark        Run LS-EEND benchmark on AMI dataset
                 qwen3-benchmark         Run Qwen3 ASR benchmark
                 qwen3-transcribe        Transcribe using Qwen3 ASR
+                granite-transcribe      Transcribe using Granite NAR CoreML
                 g2p-benchmark           Run multilingual G2P benchmark
                 nemotron-benchmark      Run Nemotron 0.6B streaming ASR benchmark
                 nemotron-transcribe     Transcribe custom audio files with Nemotron
