@@ -38,6 +38,8 @@ public struct GraniteOverlapDiagnostic: Sendable {
 public actor GraniteAsrManager {
     private var models: GraniteAsrModels?
     private var featureExtractor: GraniteFeatureExtractor?
+    private var loadedSpeedModel: MLModel?
+    private var computeUnits: MLComputeUnits = .cpuAndGPU
 
     public init() {}
 
@@ -49,6 +51,8 @@ public actor GraniteAsrManager {
         let extractor = try GraniteFeatureExtractor(modelDirectory: directory, manifest: loadedModels.manifest)
         models = loadedModels
         featureExtractor = extractor
+        loadedSpeedModel = loadedModels.speedModel
+        self.computeUnits = computeUnits
         graniteAsrLogger.info("Granite NAR ASR models loaded")
     }
 
@@ -80,7 +84,7 @@ public actor GraniteAsrManager {
             durationSeconds: durationSeconds,
             manifest: models.manifest
         )
-        let selected = try selectedModel(windowSeconds: windowSeconds, models: models)
+        let selected = try await selectedModel(windowSeconds: windowSeconds, models: models)
         let chunks = try makeChunks(
             totalSamples: audioSamples.count,
             sampleRate: models.manifest.sampleRate,
@@ -150,7 +154,7 @@ public actor GraniteAsrManager {
     private func selectedModel(
         windowSeconds: Int,
         models: GraniteAsrModels
-    ) throws -> (model: MLModel, meta: GraniteWindowMeta) {
+    ) async throws -> (model: MLModel, meta: GraniteWindowMeta) {
         let key = "\(windowSeconds)s"
         guard let meta = models.manifest.windows[key] else {
             throw GraniteAsrError.modelNotFound("window \(key)")
@@ -159,7 +163,16 @@ public actor GraniteAsrManager {
         if windowSeconds == models.manifest.defaultWindowSeconds {
             return (models.balancedModel, meta)
         }
-        if windowSeconds == models.manifest.speedWindowSeconds, let speedModel = models.speedModel {
+        if windowSeconds == models.manifest.speedWindowSeconds, let speedModel = loadedSpeedModel ?? models.speedModel {
+            return (speedModel, meta)
+        }
+        if windowSeconds == models.manifest.speedWindowSeconds {
+            let speedModel = try await GraniteAsrModels.loadWindowModel(
+                meta,
+                from: models.modelDirectory,
+                computeUnits: computeUnits
+            )
+            loadedSpeedModel = speedModel
             return (speedModel, meta)
         }
         if let fallbackMeta = models.manifest.windows["\(models.manifest.defaultWindowSeconds)s"] {

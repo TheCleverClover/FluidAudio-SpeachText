@@ -126,7 +126,8 @@ public struct GraniteAsrModels {
 
     public static func load(
         from directory: URL,
-        computeUnits: MLComputeUnits = .cpuAndGPU
+        computeUnits: MLComputeUnits = .cpuAndGPU,
+        loadSpeedModel: Bool = false
     ) async throws -> GraniteAsrModels {
         let manifest = try loadManifest(from: directory)
         let tokenizer = try await GraniteTokenizer(modelDirectory: directory)
@@ -143,7 +144,7 @@ public struct GraniteAsrModels {
 
         let speedModel: MLModel?
         let speedKey = "\(manifest.speedWindowSeconds)s"
-        if speedKey != balancedKey, let speedMeta = manifest.windows[speedKey] {
+        if loadSpeedModel, speedKey != balancedKey, let speedMeta = manifest.windows[speedKey] {
             speedModel = try await loadPackage(
                 named: speedMeta.package,
                 from: directory,
@@ -165,6 +166,18 @@ public struct GraniteAsrModels {
             manifest: manifest,
             tokenizer: tokenizer,
             modelDirectory: directory
+        )
+    }
+
+    public static func loadWindowModel(
+        _ meta: GraniteWindowMeta,
+        from directory: URL,
+        computeUnits: MLComputeUnits = .cpuAndGPU
+    ) async throws -> MLModel {
+        try await loadPackage(
+            named: meta.package,
+            from: directory,
+            computeUnits: computeUnits
         )
     }
 
