@@ -15,11 +15,23 @@ enum GraniteTranscribeCommand {
     private static let logger = AppLogger(category: "GraniteTranscribe")
 
     static func run(arguments: [String]) async {
+        if isHelpRequest(arguments) {
+            printUsage()
+            return
+        }
+
         guard let options = parseOptions(arguments) else {
             return
         }
 
         await transcribe(options: options)
+    }
+
+    private static func isHelpRequest(_ arguments: [String]) -> Bool {
+        if arguments.first == "--help" || arguments.first == "-h" {
+            return true
+        }
+        return false
     }
 
     private static func parseOptions(_ arguments: [String]) -> GraniteTranscribeOptions? {
@@ -82,10 +94,14 @@ enum GraniteTranscribeCommand {
         do {
             let defaultDir = GraniteAsrModels.defaultCacheDirectory().path
             let directory = URL(fileURLWithPath: options.modelDir ?? defaultDir)
-            guard GraniteAsrModels.modelsExist(at: directory) else {
-                logger.error("Granite CoreML bundle missing at \(directory.path)")
-                logger.error("Use --model-dir /path/to/fluid_audio_granite_nar")
-                return
+            if GraniteAsrModels.modelsExist(at: directory) == false {
+                if options.modelDir == nil {
+                    logger.info("Downloading Granite NAR CoreML bundle...")
+                    try await GraniteAsrModels.download(to: directory)
+                } else {
+                    logger.error("Granite CoreML bundle missing at \(directory.path)")
+                    return
+                }
             }
 
             logger.info("Loading Granite NAR bundle from: \(directory.path)")
@@ -208,16 +224,16 @@ enum GraniteTranscribeCommand {
     }
 
     private static func printUsage() {
-        logger.info(
+        print(
             """
 
             Granite NAR Transcribe Command
 
-            Usage: fluidaudio granite-transcribe <audio_file> --model-dir <bundle> [options]
+            Usage: fluidaudio granite-transcribe <audio_file> [options]
 
             Options:
                 --help, -h                  Show this help message
-                --model-dir <path>          Local Granite NAR CoreML bundle
+                --model-dir <path>          Local Granite NAR CoreML bundle; downloads default if omitted
                 --reference <txt>           Reference transcript; prints WER/CER
                 --mode <balanced|speed|long-speed>
                                             balanced: 35s/5s overlap

@@ -187,7 +187,37 @@ public struct GraniteAsrModels {
         return appSupport
             .appendingPathComponent("FluidAudio", isDirectory: true)
             .appendingPathComponent("Models", isDirectory: true)
-            .appendingPathComponent("granite-speech-4.1-2b-nar-coreml", isDirectory: true)
+            .appendingPathComponent(GraniteAsrBundleDownloader.folderName, isDirectory: true)
+    }
+
+    @discardableResult
+    public static func download(
+        to directory: URL? = nil,
+        force: Bool = false,
+        progressHandler: DownloadUtils.ProgressHandler? = nil
+    ) async throws -> URL {
+        let targetDir = directory ?? defaultCacheDirectory()
+        if !force, modelsExist(at: targetDir) {
+            graniteModelLogger.info("Granite NAR CoreML bundle already present at \(targetDir.path, privacy: .public)")
+            return targetDir
+        }
+
+        if force, FileManager.default.fileExists(atPath: targetDir.path) {
+            try FileManager.default.removeItem(at: targetDir)
+        }
+
+        try await GraniteAsrBundleDownloader.download(to: targetDir, progressHandler: progressHandler)
+        return targetDir
+    }
+
+    public static func downloadAndLoad(
+        to directory: URL? = nil,
+        computeUnits: MLComputeUnits = .cpuAndGPU,
+        loadSpeedModel: Bool = false,
+        progressHandler: DownloadUtils.ProgressHandler? = nil
+    ) async throws -> GraniteAsrModels {
+        let targetDir = try await download(to: directory, progressHandler: progressHandler)
+        return try await load(from: targetDir, computeUnits: computeUnits, loadSpeedModel: loadSpeedModel)
     }
 
     public static func modelsExist(at directory: URL) -> Bool {
