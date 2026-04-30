@@ -30,12 +30,14 @@ public final class GraniteFeatureExtractor {
     private var melFrame: [Float]
     private var paddedAudioScratch: [Float]
     private var logMelScratch: [Float]
+    private var inputFeatureCache: [Int: MLMultiArray]
+    private var attentionMaskCache: [Int: MLMultiArray]
 
     public init(modelDirectory: URL, manifest: GraniteAsrManifest) throws {
         self.manifest = manifest
         numFreqBins = manifest.nFFT / 2 + 1
         windowOffset = (manifest.nFFT - manifest.winLength) / 2
-        hannWindow = Self.createHannWindow(length: manifest.winLength)
+        hannWindow = createGraniteHannWindow(length: manifest.winLength)
 
         let filterURL = modelDirectory.appendingPathComponent(manifest.melFilters)
         let expectedFilterCount = manifest.nMels * (manifest.nFFT / 2 + 1)
@@ -68,6 +70,8 @@ public final class GraniteFeatureExtractor {
         melFrame = [Float](repeating: 0, count: manifest.nMels)
         paddedAudioScratch = []
         logMelScratch = []
+        inputFeatureCache = [:]
+        attentionMaskCache = [:]
     }
 
     deinit {
@@ -125,14 +129,27 @@ public final class GraniteFeatureExtractor {
         windowFrames: Int,
         validEncoderFrames: Int
     ) throws -> (features: MLMultiArray, mask: MLMultiArray) {
-        let features = try MLMultiArray(
-            shape: [1, NSNumber(value: windowFrames), NSNumber(value: manifest.nMels * 2)],
-            dataType: .float32
-        )
-        let mask = try MLMultiArray(
-            shape: [1, NSNumber(value: windowFrames)],
-            dataType: .int32
-        )
+        let features: MLMultiArray
+        if let cached = inputFeatureCache[windowFrames] {
+            features = cached
+        } else {
+            features = try MLMultiArray(
+                shape: [1, NSNumber(value: windowFrames), NSNumber(value: manifest.nMels * 2)],
+                dataType: .float32
+            )
+            inputFeatureCache[windowFrames] = features
+        }
+
+        let mask: MLMultiArray
+        if let cached = attentionMaskCache[windowFrames] {
+            mask = cached
+        } else {
+            mask = try MLMultiArray(
+                shape: [1, NSNumber(value: windowFrames)],
+                dataType: .int32
+            )
+            attentionMaskCache[windowFrames] = mask
+        }
 
         let featurePtr = features.dataPointer.bindMemory(to: Float.self, capacity: features.count)
         let maskPtr = mask.dataPointer.bindMemory(to: Int32.self, capacity: mask.count)
@@ -272,12 +289,13 @@ public final class GraniteFeatureExtractor {
         vDSP_vadd(powerSpec, 1, imagSq, 1, &powerSpec, 1, vDSP_Length(numFreqBins))
     }
 
-    private static func createHannWindow(length: Int) -> [Float] {
-        var window = [Float](repeating: 0, count: length)
-        let windowLength = Float(length)
-        for index in 0 ..< length {
-            window[index] = 0.5 * (1.0 - cosf(2.0 * .pi * Float(index) / windowLength))
-        }
-        return window
+}
+
+private func createGraniteHannWindow(length: Int) -> [Float] {
+    var window = [Float](repeating: 0, count: length)
+    let windowLength = Float(length)
+    for index in 0 ..< length {
+        window[index] = 0.5 * (1.0 - cosf(2.0 * .pi * Float(index) / windowLength))
     }
+    return window
 }
