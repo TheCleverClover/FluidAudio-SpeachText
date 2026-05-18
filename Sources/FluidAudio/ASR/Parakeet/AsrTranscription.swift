@@ -224,7 +224,9 @@ extension AsrManager {
         source: AudioSource,
         previousTokens: [Int] = [],
         isLastChunk: Bool = false
-    ) async throws -> (tokens: [Int], timestamps: [Int], confidences: [Float], encoderSequenceLength: Int) {
+    ) async throws -> (
+        tokens: [Int], timestamps: [Int], confidences: [Float], durations: [Int], encoderSequenceLength: Int
+    ) {
         // Select and copy decoder state for the source
         var state = (source == .microphone) ? microphoneDecoderState : systemDecoderState
 
@@ -270,11 +272,13 @@ extension AsrManager {
             let adjustedConfidences =
                 removedCount > 0
                 ? Array(hypothesis.tokenConfidences.dropFirst(removedCount)) : hypothesis.tokenConfidences
+            let adjustedDurations =
+                removedCount > 0 ? Array(hypothesis.tokenDurations.dropFirst(removedCount)) : hypothesis.tokenDurations
 
-            return (deduped, adjustedTimestamps, adjustedConfidences, encLen)
+            return (deduped, adjustedTimestamps, adjustedConfidences, adjustedDurations, encLen)
         }
 
-        return (hypothesis.ySequence, hypothesis.timestamps, hypothesis.tokenConfidences, encLen)
+        return (hypothesis.ySequence, hypothesis.timestamps, hypothesis.tokenConfidences, hypothesis.tokenDurations, encLen)
     }
 
     internal func processTranscriptionResult(
