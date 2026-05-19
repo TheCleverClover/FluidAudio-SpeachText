@@ -16,10 +16,13 @@ public class Tokenizer {
         }
     }
 
-    public func decode(ids: [Int]) -> String {
+    public func decode(ids: [Int], skipSpecialTokens: Bool = false) -> String {
         var text = ""
         for id in ids {
             if let token = idToToken[id] {
+                if skipSpecialTokens && token.hasPrefix("<") && token.hasSuffix(">") {
+                    continue
+                }
                 text += token
             }
         }

@@ -8,6 +8,11 @@ extension NemotronStreamingAsrManager {
 
     /// Process a single audio chunk through the full pipeline
     internal func processChunk(_ samples: [Float]) async throws {
+        if config.modelLayout == .singleEncoder {
+            try await processSingleEncoderChunk(samples)
+            return
+        }
+
         guard let preprocessor = preprocessor,
             let encoder = encoder,
             let decoder = decoder,
@@ -150,6 +155,125 @@ extension NemotronStreamingAsrManager {
         processedChunks += 1
     }
 
+    private func processSingleEncoderChunk(_ samples: [Float]) async throws {
+        guard let preprocessor = preprocessor,
+            let encoder = encoder,
+            let decoder = decoder,
+            let joint = joint,
+            let cacheChannel = cacheChannel,
+            let cacheTime = cacheTime,
+            let cacheLen = cacheLen,
+            var currentH = hState,
+            var currentC = cState
+        else {
+            throw ASRError.notInitialized
+        }
+
+        var currentToken = lastToken
+        let audioArray = try createPaddedAudioArray(samples, count: config.maxAudioSamples ?? samples.count)
+        let audioLen = try MLMultiArray(shape: [1], dataType: .int32)
+        audioLen[0] = NSNumber(value: samples.count)
+
+        let preprocInput = try MLDictionaryFeatureProvider(dictionary: [
+            "audio_signal": MLFeatureValue(multiArray: audioArray),
+            "audio_length": MLFeatureValue(multiArray: audioLen),
+        ])
+
+        let preprocOutput = try await preprocessor.prediction(from: preprocInput)
+        guard let processedSignal = preprocOutput.featureValue(for: "processed_signal")?.multiArrayValue else {
+            throw ASRError.processingFailed("Preprocessor failed to produce processed_signal output")
+        }
+
+        let encoderMel = try buildSingleEncoderMelInput(from: processedSignal)
+        let melLen = try MLMultiArray(shape: [1], dataType: .int32)
+        melLen[0] = NSNumber(value: config.totalMelFrames)
+
+        let encoderInput = try MLDictionaryFeatureProvider(dictionary: [
+            "processed_signal": MLFeatureValue(multiArray: encoderMel),
+            "processed_signal_length": MLFeatureValue(multiArray: melLen),
+            "cache_last_channel": MLFeatureValue(multiArray: cacheChannel),
+            "cache_last_time": MLFeatureValue(multiArray: cacheTime),
+            "cache_last_channel_len": MLFeatureValue(multiArray: cacheLen),
+        ])
+
+        let encoderOutput = try await encoder.prediction(from: encoderInput)
+        if let newCacheChannel = encoderOutput.featureValue(for: "cache_last_channel_next")?.multiArrayValue {
+            self.cacheChannel = newCacheChannel
+        }
+        if let newCacheTime = encoderOutput.featureValue(for: "cache_last_time_next")?.multiArrayValue {
+            self.cacheTime = newCacheTime
+        }
+        if let newCacheLen = encoderOutput.featureValue(for: "cache_last_channel_next_len")?.multiArrayValue {
+            self.cacheLen = newCacheLen
+        }
+
+        guard let encoded = encoderOutput.featureValue(for: "encoded")?.multiArrayValue else {
+            throw ASRError.processingFailed("Encoder failed to produce encoded output")
+        }
+
+        melCache = try extractMelCache(from: encoderMel)
+        let numEncoderFrames = encoded.shape[2].intValue
+        var newTokens: [Int] = []
+
+        for t in 0..<numEncoderFrames {
+            let encStep = try extractEncoderStep(from: encoded, timeIndex: t)
+
+            for _ in 0..<10 {
+                let tokenInput = try MLMultiArray(shape: [1, 1], dataType: .int32)
+                tokenInput[0] = NSNumber(value: currentToken)
+
+                let tokenLen = try MLMultiArray(shape: [1], dataType: .int32)
+                tokenLen[0] = 1
+
+                let decoderInput = try MLDictionaryFeatureProvider(dictionary: [
+                    "targets": MLFeatureValue(multiArray: tokenInput),
+                    "target_length": MLFeatureValue(multiArray: tokenLen),
+                    "h_in": MLFeatureValue(multiArray: currentH),
+                    "c_in": MLFeatureValue(multiArray: currentC),
+                ])
+
+                let decoderOutput = try await decoder.prediction(from: decoderInput)
+                guard let decoderOut = decoderOutput.featureValue(for: "decoder")?.multiArrayValue,
+                    let hOut = decoderOutput.featureValue(for: "h_out")?.multiArrayValue,
+                    let cOut = decoderOutput.featureValue(for: "c_out")?.multiArrayValue
+                else {
+                    throw ASRError.processingFailed("Decoder failed")
+                }
+
+                let jointInput = try MLDictionaryFeatureProvider(dictionary: [
+                    "encoded": MLFeatureValue(multiArray: encStep),
+                    "decoder": MLFeatureValue(multiArray: decoderOut),
+                ])
+
+                let jointOutput = try await joint.prediction(from: jointInput)
+                guard let logits = jointOutput.featureValue(for: "logits")?.multiArrayValue else {
+                    throw ASRError.processingFailed("Joint failed")
+                }
+
+                let predToken = findMaxIndex(logits)
+                if predToken == config.blankIdx {
+                    break
+                }
+
+                newTokens.append(predToken)
+                accumulatedTokenIds.append(predToken)
+                currentToken = Int32(predToken)
+                currentH = hOut
+                currentC = cOut
+            }
+        }
+
+        self.lastToken = currentToken
+        self.hState = currentH
+        self.cState = currentC
+
+        if !newTokens.isEmpty, let callback = partialCallback, let tokenizer = tokenizer {
+            callback(tokenizer.decode(ids: accumulatedTokenIds, skipSpecialTokens: true))
+        }
+
+        processedChunks += 1
+    }
+
     // MARK: - Tensor Utilities
 
     internal func createAudioArray(_ samples: [Float]) throws -> MLMultiArray {
@@ -157,6 +281,46 @@ extension NemotronStreamingAsrManager {
         let ptr = array.dataPointer.bindMemory(to: Float.self, capacity: samples.count)
         ptr.update(from: samples, count: samples.count)
         return array
+    }
+
+    internal func createPaddedAudioArray(_ samples: [Float], count: Int) throws -> MLMultiArray {
+        let array = try MLMultiArray(shape: [1, NSNumber(value: count)], dataType: .float32)
+        array.reset(to: 0)
+        let copyCount = min(samples.count, count)
+        let ptr = array.dataPointer.bindMemory(to: Float.self, capacity: array.count)
+        ptr.update(from: samples, count: copyCount)
+        return array
+    }
+
+    internal func buildSingleEncoderMelInput(from processedSignal: MLMultiArray) throws -> MLMultiArray {
+        let result = try MLMultiArray(
+            shape: [1, NSNumber(value: config.melFeatures), NSNumber(value: config.totalMelFrames)],
+            dataType: .float32
+        )
+        result.reset(to: 0)
+
+        if let melCache = melCache {
+            let cacheFrames = min(melCache.shape[2].intValue, config.preEncodeCache)
+
+            for mel in 0..<config.melFeatures {
+                for t in 0..<cacheFrames {
+                    result[[0, NSNumber(value: mel), NSNumber(value: t)]] =
+                        melCache[[0, NSNumber(value: mel), NSNumber(value: t)]]
+                }
+            }
+        }
+
+        let signalFrames = processedSignal.shape[2].intValue
+        let copyFrames = min(config.chunkMelFrames, signalFrames, config.totalMelFrames - config.preEncodeCache)
+
+        for mel in 0..<config.melFeatures {
+            for t in 0..<copyFrames {
+                result[[0, NSNumber(value: mel), NSNumber(value: config.preEncodeCache + t)]] =
+                    processedSignal[[0, NSNumber(value: mel), NSNumber(value: t)]]
+            }
+        }
+
+        return result
     }
 
     internal func prependMelCache(to chunkMel: MLMultiArray) throws -> MLMultiArray {

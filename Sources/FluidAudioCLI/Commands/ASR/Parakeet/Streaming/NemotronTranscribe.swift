@@ -107,7 +107,8 @@ public class NemotronTranscribe {
     /// Run transcription
     public func run() async {
         logger.info(String(repeating: "=", count: 70))
-        logger.info("NEMOTRON SPEECH STREAMING TRANSCRIPTION (\(config.chunkSize.rawValue)ms chunks)")
+        let chunkLabel = config.modelDir == nil ? "\(config.chunkSize.rawValue)ms chunks" : "metadata-driven chunks"
+        logger.info("NEMOTRON SPEECH STREAMING TRANSCRIPTION (\(chunkLabel))")
         logger.info(String(repeating: "=", count: 70))
 
         #if DEBUG

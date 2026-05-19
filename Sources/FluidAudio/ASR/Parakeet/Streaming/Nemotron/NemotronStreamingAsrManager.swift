@@ -83,20 +83,33 @@ public actor NemotronStreamingAsrManager {
         }
 
         // Load preprocessor
-        let preprocessorPath = modelDir.appendingPathComponent(ModelNames.NemotronStreaming.preprocessorFile)
-        self.preprocessor = try await MLModel.load(contentsOf: preprocessorPath, configuration: mlConfiguration)
+        let preprocessorPath = try resolveModelURL(
+            in: modelDir,
+            candidates: [ModelNames.NemotronStreaming.preprocessorFile, "preprocessor.mlpackage"]
+        )
+        self.preprocessor = try await loadCoreMLModel(at: preprocessorPath)
 
-        // Load encoder (int8 quantized)
-        let encoderPath = modelDir.appendingPathComponent("encoder").appendingPathComponent(NemotronEncoder.fileName)
-        self.encoder = try await MLModel.load(contentsOf: encoderPath, configuration: mlConfiguration)
+        let encoderPath: URL
+        if config.modelLayout == .singleEncoder {
+            encoderPath = try resolveModelURL(in: modelDir, candidates: ["encoder.mlmodelc", "encoder.mlpackage"])
+        } else {
+            encoderPath = modelDir.appendingPathComponent("encoder").appendingPathComponent(NemotronEncoder.fileName)
+        }
+        self.encoder = try await loadCoreMLModel(at: encoderPath)
 
         // Load decoder
-        let decoderPath = modelDir.appendingPathComponent(ModelNames.NemotronStreaming.decoderFile)
-        self.decoder = try await MLModel.load(contentsOf: decoderPath, configuration: mlConfiguration)
+        let decoderPath = try resolveModelURL(
+            in: modelDir,
+            candidates: [ModelNames.NemotronStreaming.decoderFile, "decoder.mlpackage"]
+        )
+        self.decoder = try await loadCoreMLModel(at: decoderPath)
 
         // Load joint
-        let jointPath = modelDir.appendingPathComponent(ModelNames.NemotronStreaming.jointFile)
-        self.joint = try await MLModel.load(contentsOf: jointPath, configuration: mlConfiguration)
+        let jointPath = try resolveModelURL(
+            in: modelDir,
+            candidates: [ModelNames.NemotronStreaming.jointFile, "joint.mlpackage"]
+        )
+        self.joint = try await loadCoreMLModel(at: jointPath)
 
         // Load tokenizer
         let tokenizerUrl = modelDir.appendingPathComponent(ModelNames.NemotronStreaming.tokenizer)
@@ -106,6 +119,24 @@ public actor NemotronStreamingAsrManager {
         try resetStates()
 
         logger.info("Nemotron models loaded successfully (\(config.chunkMs)ms chunks).")
+    }
+
+    private func resolveModelURL(in modelDir: URL, candidates: [String]) throws -> URL {
+        for candidate in candidates {
+            let url = modelDir.appendingPathComponent(candidate)
+            if FileManager.default.fileExists(atPath: url.path) {
+                return url
+            }
+        }
+        throw ASRError.processingFailed("Missing model file: \(candidates.joined(separator: " or "))")
+    }
+
+    private func loadCoreMLModel(at url: URL) async throws -> MLModel {
+        if url.pathExtension == "mlpackage" {
+            let compiledURL = try await MLModel.compileModel(at: url)
+            return try await MLModel.load(contentsOf: compiledURL, configuration: mlConfiguration)
+        }
+        return try await MLModel.load(contentsOf: url, configuration: mlConfiguration)
     }
 
     /// Reset all states for a new transcription session
@@ -209,7 +240,10 @@ public actor NemotronStreamingAsrManager {
         }
 
         // Decode accumulated tokens
-        let transcript = tokenizer.decode(ids: accumulatedTokenIds)
+        let transcript = tokenizer.decode(
+            ids: accumulatedTokenIds,
+            skipSpecialTokens: config.modelLayout == .singleEncoder
+        )
         accumulatedTokenIds.removeAll()
 
         return transcript
@@ -218,7 +252,10 @@ public actor NemotronStreamingAsrManager {
     /// Get current partial transcript without finishing
     public func getPartialTranscript() -> String {
         guard let tokenizer = tokenizer else { return "" }
-        return tokenizer.decode(ids: accumulatedTokenIds)
+        return tokenizer.decode(
+            ids: accumulatedTokenIds,
+            skipSpecialTokens: config.modelLayout == .singleEncoder
+        )
     }
 }
 
