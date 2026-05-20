@@ -88,6 +88,8 @@ public struct NemotronStreamingConfig: Sendable {
         self.cacheChannelShape = json["cache_channel_shape"] as? [Int] ?? shapes["cache_last_channel"] ?? [1, 24, 70, 1024]
         self.cacheTimeShape = json["cache_time_shape"] as? [Int] ?? shapes["cache_last_time"] ?? [1, 24, 1024, 8]
         self.modelLayout = singleEncoder ? .singleEncoder : .legacy
-        self.maxAudioSamples = json["max_audio_samples"] as? Int ?? shapes["audio_signal"]?[1]
+        let coreML = json["coreml"] as? [String: Any]
+        let flexiblePreprocessor = coreML?["preprocessor_audio_flexible"] as? Bool ?? false
+        self.maxAudioSamples = flexiblePreprocessor ? nil : (json["max_audio_samples"] as? Int ?? shapes["audio_signal"]?[1])
     }
 }

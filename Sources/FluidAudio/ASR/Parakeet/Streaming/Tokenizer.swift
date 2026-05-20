@@ -4,6 +4,17 @@ public class Tokenizer {
     private var vocab: [String: String] = [:]
     private var idToToken: [Int: String] = [:]
 
+    public convenience init(modelDirectory: URL) throws {
+        let jsonURL = modelDirectory.appendingPathComponent("tokenizer.json")
+        if FileManager.default.fileExists(atPath: jsonURL.path) {
+            try self.init(vocabPath: jsonURL)
+            return
+        }
+
+        let modelURL = modelDirectory.appendingPathComponent("tokenizer.model")
+        try self.init(sentencePiecePath: modelURL)
+    }
+
     public init(vocabPath: URL) throws {
         let data = try Data(contentsOf: vocabPath)
         let json = try JSONSerialization.jsonObject(with: data, options: []) as! [String: String]
@@ -13,6 +24,16 @@ public class Tokenizer {
             if let id = Int(key) {
                 self.idToToken[id] = value
             }
+        }
+    }
+
+    public init(sentencePiecePath: URL) throws {
+        let data = try Data(contentsOf: sentencePiecePath)
+        let pieces = try SentencePieceProto.parse(data)
+
+        for (id, piece) in pieces.enumerated() {
+            self.idToToken[id] = piece.piece
+            self.vocab[String(id)] = piece.piece
         }
     }
 

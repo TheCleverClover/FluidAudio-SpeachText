@@ -117,6 +117,97 @@ final class NemotronStreamingConfigTests: XCTestCase {
         XCTAssertEqual(config.chunkSamples, 56 * 160)  // 8960 samples
     }
 
+    func testLoadSingleEncoderMetadataJson() throws {
+        let metadata: [String: Any] = [
+            "model_layout": "single_encoder",
+            "sample_rate": 16000,
+            "vocab_size": 13087,
+            "blank_idx": 13087,
+            "decoder_hidden": 640,
+            "decoder_layers": 2,
+            "max_audio_samples": 240000,
+            "coreml": [
+                "components": [
+                    "preprocessor": "preprocessor.mlpackage",
+                    "encoder": "encoder.mlpackage",
+                    "decoder": "decoder.mlpackage",
+                    "joint": "joint.mlpackage",
+                ]
+            ],
+            "shapes": [
+                "audio_signal": [1, 240000],
+                "processed_signal_step": [1, 128, 17],
+                "cache_last_channel": [1, 24, 56, 1024],
+                "cache_last_time": [1, 24, 1024, 8],
+                "encoded_step": [1, 1024, 1],
+            ],
+        ]
+
+        let file = try createTempJsonFile(metadata)
+        let config = try NemotronStreamingConfig(from: file)
+
+        XCTAssertEqual(config.modelLayout, .singleEncoder)
+        XCTAssertEqual(config.melFeatures, 128)
+        XCTAssertEqual(config.preEncodeCache, 9)
+        XCTAssertEqual(config.totalMelFrames, 17)
+        XCTAssertEqual(config.chunkMelFrames, 8)
+        XCTAssertEqual(config.chunkMs, 80)
+        XCTAssertEqual(config.chunkSamples, 1280)
+        XCTAssertEqual(config.vocabSize, 13087)
+        XCTAssertEqual(config.blankIdx, 13087)
+        XCTAssertEqual(config.maxAudioSamples, 240000)
+        XCTAssertEqual(config.cacheChannelShape, [1, 24, 56, 1024])
+        XCTAssertEqual(config.cacheTimeShape, [1, 24, 1024, 8])
+    }
+
+    func testSingleEncoderFlexiblePreprocessorDoesNotForceMaxAudioPadding() throws {
+        let metadata: [String: Any] = [
+            "max_audio_samples": 240000,
+            "coreml": [
+                "preprocessor_audio_flexible": true,
+                "components": [
+                    "encoder": "encoder.mlpackage"
+                ],
+            ],
+            "shapes": [
+                "audio_signal": [1, 240000],
+                "processed_signal_step": [1, 128, 17],
+            ],
+        ]
+
+        let file = try createTempJsonFile(metadata)
+        let config = try NemotronStreamingConfig(from: file)
+
+        XCTAssertEqual(config.modelLayout, .singleEncoder)
+        XCTAssertNil(config.maxAudioSamples)
+        XCTAssertEqual(config.chunkSamples, 1280)
+    }
+
+    func testSingleEncoderLargerStreamingWindowUsesMetadataShape() throws {
+        let metadata: [String: Any] = [
+            "coreml": [
+                "preprocessor_audio_flexible": true,
+                "components": [
+                    "encoder": "encoder.mlpackage"
+                ],
+            ],
+            "shapes": [
+                "processed_signal_step": [1, 128, 137],
+                "encoded_step": [1, 1024, 16],
+            ],
+        ]
+
+        let file = try createTempJsonFile(metadata)
+        let config = try NemotronStreamingConfig(from: file)
+
+        XCTAssertEqual(config.modelLayout, .singleEncoder)
+        XCTAssertEqual(config.totalMelFrames, 137)
+        XCTAssertEqual(config.chunkMelFrames, 128)
+        XCTAssertEqual(config.chunkMs, 1280)
+        XCTAssertEqual(config.chunkSamples, 20480)
+        XCTAssertNil(config.maxAudioSamples)
+    }
+
     // MARK: - P0: JSON Loading - Fallback Defaults
 
     func testLoadPartialJsonUsesDefaults() throws {

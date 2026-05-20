@@ -136,7 +136,8 @@ public class NemotronBenchmark {
             logger.info("Loading Nemotron models...")
             let manager = NemotronStreamingAsrManager()
             try await manager.loadModels(modelDir: modelDir)
-            logger.info("Models loaded successfully")
+            let loadedChunkMs = await manager.config.chunkMs
+            logger.info("Models loaded successfully (\(loadedChunkMs)ms chunks)")
 
             // 4. Get audio files
             let datasetPath = getLibriSpeechDirectory().appendingPathComponent(config.subset)
@@ -201,7 +202,7 @@ public class NemotronBenchmark {
             logger.info(String(repeating: "=", count: 70))
             logger.info("SUMMARY")
             logger.info(String(repeating: "=", count: 70))
-            logger.info("Chunk size:         \(config.chunkSize.rawValue)ms")
+            logger.info("Chunk size:         \(loadedChunkMs)ms")
             logger.info("Files processed:    \(filesToProcess.count)")
             logger.info("Total words:        \(totalWords)")
             logger.info("Total errors:       \(totalErrors)")
@@ -212,7 +213,7 @@ public class NemotronBenchmark {
 
             // Save JSON results
             let jsonOutput = BenchmarkResults(
-                chunkSize: config.chunkSize.rawValue,
+                chunkSize: loadedChunkMs,
                 filesProcessed: filesToProcess.count,
                 totalWords: totalWords,
                 totalErrors: totalErrors,
@@ -226,7 +227,7 @@ public class NemotronBenchmark {
                 let encoder = JSONEncoder()
                 encoder.outputFormatting = .prettyPrinted
                 let data = try encoder.encode(jsonOutput)
-                let outputPath = "/tmp/nemotron_\(config.chunkSize.rawValue)ms_benchmark.json"
+                let outputPath = "/tmp/nemotron_\(loadedChunkMs)ms_benchmark.json"
                 try data.write(to: URL(fileURLWithPath: outputPath))
                 print("Results saved to \(outputPath)")
             } catch {

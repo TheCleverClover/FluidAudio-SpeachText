@@ -170,7 +170,12 @@ extension NemotronStreamingAsrManager {
         }
 
         var currentToken = lastToken
-        let audioArray = try createPaddedAudioArray(samples, count: config.maxAudioSamples ?? samples.count)
+        let audioArray: MLMultiArray
+        if let maxAudioSamples = config.maxAudioSamples {
+            audioArray = try createPaddedAudioArray(samples, count: maxAudioSamples)
+        } else {
+            audioArray = try createAudioArray(samples)
+        }
         let audioLen = try MLMultiArray(shape: [1], dataType: .int32)
         audioLen[0] = NSNumber(value: samples.count)
 

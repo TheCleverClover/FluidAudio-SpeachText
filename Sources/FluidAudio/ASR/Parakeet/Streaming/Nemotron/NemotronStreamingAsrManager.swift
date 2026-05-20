@@ -112,8 +112,7 @@ public actor NemotronStreamingAsrManager {
         self.joint = try await loadCoreMLModel(at: jointPath)
 
         // Load tokenizer
-        let tokenizerUrl = modelDir.appendingPathComponent(ModelNames.NemotronStreaming.tokenizer)
-        self.tokenizer = try Tokenizer(vocabPath: tokenizerUrl)
+        self.tokenizer = try Tokenizer(modelDirectory: modelDir)
 
         // Initialize states
         try resetStates()
