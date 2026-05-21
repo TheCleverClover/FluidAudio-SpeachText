@@ -193,13 +193,17 @@ extension NemotronStreamingAsrManager {
         let melLen = try MLMultiArray(shape: [1], dataType: .int32)
         melLen[0] = NSNumber(value: config.totalMelFrames)
 
-        let encoderInput = try MLDictionaryFeatureProvider(dictionary: [
+        var encoderFeatures: [String: MLFeatureValue] = [
             "processed_signal": MLFeatureValue(multiArray: encoderMel),
             "processed_signal_length": MLFeatureValue(multiArray: melLen),
             "cache_last_channel": MLFeatureValue(multiArray: cacheChannel),
             "cache_last_time": MLFeatureValue(multiArray: cacheTime),
             "cache_last_channel_len": MLFeatureValue(multiArray: cacheLen),
-        ])
+        ]
+        if config.runtimePrompt {
+            encoderFeatures["prompt_vector"] = MLFeatureValue(multiArray: try createPromptVector())
+        }
+        let encoderInput = try MLDictionaryFeatureProvider(dictionary: encoderFeatures)
 
         let encoderOutput = try await encoder.prediction(from: encoderInput)
         if let newCacheChannel = encoderOutput.featureValue(for: "cache_last_channel_next")?.multiArrayValue {
@@ -294,6 +298,24 @@ extension NemotronStreamingAsrManager {
         let copyCount = min(samples.count, count)
         let ptr = array.dataPointer.bindMemory(to: Float.self, capacity: array.count)
         ptr.update(from: samples, count: copyCount)
+        return array
+    }
+
+    internal func createPromptVector() throws -> MLMultiArray {
+        let language = activeTargetLanguage ?? config.targetLang ?? "auto"
+        guard let promptIndex = config.promptDictionary[language] else {
+            let available = config.promptDictionary.keys.sorted().prefix(12).joined(separator: ", ")
+            throw ASRError.processingFailed("Unknown Nemotron prompt language '\(language)'. Available: \(available)")
+        }
+        guard promptIndex >= 0 && promptIndex < config.numPrompts else {
+            throw ASRError.processingFailed(
+                "Prompt index \(promptIndex) for '\(language)' is outside num_prompts=\(config.numPrompts)")
+        }
+
+        let array = try MLMultiArray(shape: [1, NSNumber(value: config.numPrompts)], dataType: .float32)
+        array.reset(to: 0)
+        let ptr = array.dataPointer.bindMemory(to: Float.self, capacity: array.count)
+        ptr[promptIndex] = 1.0
         return array
     }
 

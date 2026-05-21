@@ -71,6 +71,8 @@ struct FluidAudioCLI {
             await G2PBenchmark.run(arguments: Array(arguments.dropFirst(2)))
         case "nemotron-benchmark":
             await NemotronBenchmark.run(arguments: Array(arguments.dropFirst(2)))
+        case "nemotron-commonvoice-benchmark":
+            await NemotronCommonVoiceBenchmark.run(arguments: Array(arguments.dropFirst(2)))
         case "nemotron-transcribe":
             await NemotronTranscribe.run(arguments: Array(arguments.dropFirst(2)))
         case "help", "--help", "-h":
@@ -111,6 +113,8 @@ struct FluidAudioCLI {
                 granite-transcribe      Transcribe using Granite NAR CoreML
                 g2p-benchmark           Run multilingual G2P benchmark
                 nemotron-benchmark      Run Nemotron 0.6B streaming ASR benchmark
+                nemotron-commonvoice-benchmark
+                                        Run Nemotron on Mozilla Common Voice TSV splits
                 nemotron-transcribe     Transcribe custom audio files with Nemotron
                 download                Download evaluation datasets
                 help                    Show this help message

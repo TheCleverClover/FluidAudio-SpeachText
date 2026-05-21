@@ -35,6 +35,10 @@ public struct NemotronStreamingConfig: Sendable {
     public let cacheTimeShape: [Int]
     public let modelLayout: ModelLayout
     public let maxAudioSamples: Int?
+    public let runtimePrompt: Bool
+    public let promptDictionary: [String: Int]
+    public let numPrompts: Int
+    public let targetLang: String?
 
     /// Audio samples per chunk
     public var chunkSamples: Int { chunkMelFrames * 160 }
@@ -56,6 +60,10 @@ public struct NemotronStreamingConfig: Sendable {
         self.cacheTimeShape = [1, 24, 1024, 8]
         self.modelLayout = .legacy
         self.maxAudioSamples = nil
+        self.runtimePrompt = false
+        self.promptDictionary = [:]
+        self.numPrompts = 128
+        self.targetLang = nil
     }
 
     /// Load config from metadata.json
@@ -91,5 +99,26 @@ public struct NemotronStreamingConfig: Sendable {
         let coreML = json["coreml"] as? [String: Any]
         let flexiblePreprocessor = coreML?["preprocessor_audio_flexible"] as? Bool ?? false
         self.maxAudioSamples = flexiblePreprocessor ? nil : (json["max_audio_samples"] as? Int ?? shapes["audio_signal"]?[1])
+        self.runtimePrompt = json["runtime_prompt"] as? Bool ?? false
+        self.promptDictionary = Self.parsePromptDictionary(json["prompt_dictionary"])
+        self.numPrompts = json["num_prompts"] as? Int ?? 128
+        self.targetLang = json["target_lang"] as? String
+    }
+
+    private static func parsePromptDictionary(_ value: Any?) -> [String: Int] {
+        guard let dictionary = value as? [String: Any] else {
+            return [:]
+        }
+
+        var result: [String: Int] = [:]
+        result.reserveCapacity(dictionary.count)
+        for (key, value) in dictionary {
+            if let intValue = value as? Int {
+                result[key] = intValue
+            } else if let numberValue = value as? NSNumber {
+                result[key] = numberValue.intValue
+            }
+        }
+        return result
     }
 }

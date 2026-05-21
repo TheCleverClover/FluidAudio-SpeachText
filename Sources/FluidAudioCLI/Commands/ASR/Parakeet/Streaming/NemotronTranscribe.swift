@@ -11,6 +11,7 @@ public class NemotronTranscribe {
         var inputFiles: [URL] = []
         var modelDir: URL?
         var chunkSize: NemotronChunkSize = .ms1120
+        var targetLang: String?
 
         public init() {}
     }
@@ -55,6 +56,11 @@ public class NemotronTranscribe {
                         logger.warning("Invalid chunk size: \(ms)ms. Valid options: 1120 or 560. Using default 1120ms.")
                     }
                 }
+            case "--target-lang":
+                i += 1
+                if i < arguments.count {
+                    config.targetLang = arguments[i]
+                }
             case "--help", "-h":
                 printUsage()
                 return
@@ -85,6 +91,7 @@ public class NemotronTranscribe {
                 --input, -i <path>        Audio file to transcribe (.wav) - required, can be used multiple times
                 --model-dir, -m <path>    Path to Nemotron CoreML models (optional, auto-downloads if not provided)
                 --chunk, -c <ms>          Chunk size: 1120 or 560 (default: 1120)
+                --target-lang <lang>      Runtime prompt language for multilingual bundles (for example pt-BR)
                 --help, -h                Show this help
 
             Chunk Sizes:
@@ -127,6 +134,10 @@ public class NemotronTranscribe {
             logger.info("Loading Nemotron models...")
             let manager = NemotronStreamingAsrManager()
             try await manager.loadModels(modelDir: modelDir)
+            if let targetLang = config.targetLang {
+                try await manager.setTargetLanguage(targetLang)
+                logger.info("Runtime prompt language: \(targetLang)")
+            }
             logger.info("Models loaded successfully")
             logger.info("")
 

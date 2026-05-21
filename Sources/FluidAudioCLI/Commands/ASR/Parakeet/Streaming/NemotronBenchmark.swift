@@ -12,6 +12,7 @@ public class NemotronBenchmark {
         var subset: String = "test-clean"
         var modelDir: URL?
         var chunkSize: NemotronChunkSize = .ms1120
+        var targetLang: String?
 
         public init() {}
     }
@@ -70,6 +71,11 @@ public class NemotronBenchmark {
                         logger.warning("Invalid chunk size: \(ms)ms. Valid options: 1120 or 560. Using default 1120ms.")
                     }
                 }
+            case "--target-lang":
+                i += 1
+                if i < arguments.count {
+                    config.targetLang = arguments[i]
+                }
             case "--help", "-h":
                 printUsage()
                 return
@@ -95,6 +101,7 @@ public class NemotronBenchmark {
                 --subset, -s <name>       LibriSpeech subset (default: test-clean)
                 --model-dir, -m <path>    Path to Nemotron CoreML models
                 --chunk, -c <ms>          Chunk size: 1120 or 560 (default: 1120)
+                --target-lang <lang>      Runtime prompt language for multilingual bundles
                 --help, -h                Show this help
 
             Chunk Sizes:
@@ -136,6 +143,10 @@ public class NemotronBenchmark {
             logger.info("Loading Nemotron models...")
             let manager = NemotronStreamingAsrManager()
             try await manager.loadModels(modelDir: modelDir)
+            if let targetLang = config.targetLang {
+                try await manager.setTargetLanguage(targetLang)
+                logger.info("Runtime prompt language: \(targetLang)")
+            }
             let loadedChunkMs = await manager.config.chunkMs
             logger.info("Models loaded successfully (\(loadedChunkMs)ms chunks)")
 

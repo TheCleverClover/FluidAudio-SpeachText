@@ -208,6 +208,40 @@ final class NemotronStreamingConfigTests: XCTestCase {
         XCTAssertNil(config.maxAudioSamples)
     }
 
+    func testRuntimePromptMetadataParsing() throws {
+        let metadata: [String: Any] = [
+            "runtime_prompt": true,
+            "target_lang": "pt-BR",
+            "num_prompts": 128,
+            "prompt_dictionary": [
+                "en-US": 0,
+                "pt-BR": 12,
+                "pt": 13,
+                "auto": 101,
+            ],
+            "coreml": [
+                "preprocessor_audio_flexible": true,
+                "components": [
+                    "encoder": "encoder.mlpackage"
+                ],
+            ],
+            "shapes": [
+                "processed_signal_step": [1, 128, 137],
+                "encoded_step": [1, 1024, 16],
+            ],
+        ]
+
+        let file = try createTempJsonFile(metadata)
+        let config = try NemotronStreamingConfig(from: file)
+
+        XCTAssertTrue(config.runtimePrompt)
+        XCTAssertEqual(config.targetLang, "pt-BR")
+        XCTAssertEqual(config.numPrompts, 128)
+        XCTAssertEqual(config.promptDictionary["pt-BR"], 12)
+        XCTAssertEqual(config.promptDictionary["pt"], 13)
+        XCTAssertEqual(config.promptDictionary["auto"], 101)
+    }
+
     // MARK: - P0: JSON Loading - Fallback Defaults
 
     func testLoadPartialJsonUsesDefaults() throws {

@@ -22,6 +22,7 @@ public actor NemotronStreamingAsrManager {
 
     // Configuration (loaded from metadata.json)
     public private(set) var config: NemotronStreamingConfig
+    internal var activeTargetLanguage: String?
 
     // Audio Buffer
     private var audioBuffer: [Float] = []
@@ -61,12 +62,25 @@ public actor NemotronStreamingAsrManager {
         self.mlConfiguration = configuration
         self.requestedChunkSize = requestedChunkSize
         self.config = NemotronStreamingConfig()
+        self.activeTargetLanguage = nil
         self.lastToken = Int32(config.blankIdx)
     }
 
     /// Set callback for partial transcription updates
     public func setPartialCallback(_ callback: @escaping NemotronPartialCallback) {
         self.partialCallback = callback
+    }
+
+    /// Select the runtime prompt language for multilingual Nemotron 3.5 bundles.
+    public func setTargetLanguage(_ language: String) throws {
+        guard config.runtimePrompt else {
+            throw ASRError.processingFailed("Current Nemotron model does not expose a runtime prompt input")
+        }
+        guard config.promptDictionary[language] != nil else {
+            let available = config.promptDictionary.keys.sorted().prefix(12).joined(separator: ", ")
+            throw ASRError.processingFailed("Unknown Nemotron prompt language '\(language)'. Available: \(available)")
+        }
+        activeTargetLanguage = language
     }
 
     /// Load models from a directory containing preprocessor, encoder, decoder, joint, and tokenizer
@@ -79,6 +93,7 @@ public actor NemotronStreamingAsrManager {
         let metadataPath = modelDir.appendingPathComponent(ModelNames.NemotronStreaming.metadata)
         if FileManager.default.fileExists(atPath: metadataPath.path) {
             self.config = try NemotronStreamingConfig(from: metadataPath)
+            self.activeTargetLanguage = config.targetLang
             logger.info("Loaded config: \(config.chunkMs)ms chunks, \(config.chunkMelFrames) mel frames")
         }
 
