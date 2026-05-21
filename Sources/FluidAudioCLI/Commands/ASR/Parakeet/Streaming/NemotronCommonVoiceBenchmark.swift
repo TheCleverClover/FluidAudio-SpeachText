@@ -19,6 +19,7 @@ public final class NemotronCommonVoiceBenchmark {
         var computeUnits: String = "cpuAndNeuralEngine"
         var allowLowPrecisionGPU: Bool = true
         var includeItems: Bool = false
+        var profileComponents: Bool = false
         var output: URL?
 
         public init() {}
@@ -42,6 +43,7 @@ public final class NemotronCommonVoiceBenchmark {
         let audioDuration: Double
         let processingTime: Double
         let rtfx: Double
+        let componentProfile: NemotronComponentProfile?
         let items: [SampleResult]?
     }
 
@@ -152,6 +154,8 @@ public final class NemotronCommonVoiceBenchmark {
                 config.allowLowPrecisionGPU = false
             case "--include-items":
                 config.includeItems = true
+            case "--profile-components":
+                config.profileComponents = true
             case "--output", "-o":
                 i += 1
                 if i < arguments.count {
@@ -189,6 +193,7 @@ public final class NemotronCommonVoiceBenchmark {
                 --compute-units <units>   cpuAndNeuralEngine, all, cpuAndGPU, cpuOnly (default: cpuAndNeuralEngine)
                 --disable-low-precision-gpu
                 --include-items           Include per-file hypotheses and metrics in JSON output
+                --profile-components      Include aggregate Nemotron component timings
                 --output, -o <path>       JSON output path
                 --help, -h                Show this help
 
@@ -219,8 +224,14 @@ public final class NemotronCommonVoiceBenchmark {
             let mlConfig = try makeModelConfiguration()
             let manager = NemotronStreamingAsrManager(configuration: mlConfig)
             try await manager.loadModels(modelDir: modelDir)
+            if config.profileComponents {
+                await manager.setComponentProfilingEnabled(true)
+            }
             print("Compute units: \(config.computeUnits)")
             print("Low precision GPU accumulation: \(config.allowLowPrecisionGPU)")
+            if config.profileComponents {
+                print("Component profiling: enabled")
+            }
 
             let runtimePrompt = await manager.config.runtimePrompt
             var activePromptLanguage: String?
@@ -322,6 +333,7 @@ public final class NemotronCommonVoiceBenchmark {
 
             let wer = Double(totalErrors) / Double(totalWords) * 100.0
             let rtfx = totalAudioDuration / totalProcessingTime
+            let componentProfile = config.profileComponents ? await manager.componentProfileSnapshot() : nil
 
             let summary = BenchmarkSummary(
                 datasetDir: datasetDir.path,
@@ -341,6 +353,7 @@ public final class NemotronCommonVoiceBenchmark {
                 audioDuration: totalAudioDuration,
                 processingTime: totalProcessingTime,
                 rtfx: rtfx,
+                componentProfile: componentProfile,
                 items: config.includeItems ? itemResults : nil
             )
 
@@ -356,6 +369,18 @@ public final class NemotronCommonVoiceBenchmark {
             print("Audio duration:  \(String(format: "%.1f", totalAudioDuration))s")
             print("Processing time: \(String(format: "%.1f", totalProcessingTime))s")
             print("RTFx:            \(String(format: "%.1f", rtfx))x")
+            if let componentProfile {
+                print("")
+                print("COMPONENT PROFILE")
+                print("Chunks:          \(componentProfile.chunks)")
+                print("Decode steps:    \(componentProfile.decodeSteps)")
+                printComponentTiming("preprocessor", componentProfile.preprocessorTime, totalProcessingTime)
+                printComponentTiming("encoder", componentProfile.encoderTime, totalProcessingTime)
+                printComponentTiming("decoder", componentProfile.decoderTime, totalProcessingTime)
+                printComponentTiming("jointDecision", componentProfile.jointDecisionTime, totalProcessingTime)
+                printComponentTiming("decodeLoop", componentProfile.decodeLoopTime, totalProcessingTime)
+                printComponentTiming("totalChunk", componentProfile.totalChunkTime, totalProcessingTime)
+            }
             print("Results saved to \(outputURL.path)")
         } catch {
             logger.error("Common Voice benchmark failed: \(error.localizedDescription)")
@@ -520,6 +545,11 @@ public final class NemotronCommonVoiceBenchmark {
         default:
             return language
         }
+    }
+
+    private func printComponentTiming(_ name: String, _ seconds: Double, _ totalProcessingTime: Double) {
+        let share = totalProcessingTime > 0 ? seconds / totalProcessingTime * 100.0 : 0.0
+        print("\(name.padding(toLength: 16, withPad: " ", startingAt: 0)) \(String(format: "%.3f", seconds))s (\(String(format: "%.1f", share))%)")
     }
 }
 #endif

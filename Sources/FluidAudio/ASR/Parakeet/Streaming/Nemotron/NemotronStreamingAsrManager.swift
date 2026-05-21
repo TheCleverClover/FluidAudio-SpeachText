@@ -5,6 +5,23 @@ import Foundation
 /// Callback invoked when new tokens are decoded (for live transcription updates)
 public typealias NemotronPartialCallback = @Sendable (String) -> Void
 
+public struct NemotronComponentProfile: Codable, Sendable {
+    public var chunks: Int = 0
+    public var decodeSteps: Int = 0
+    public var audioInputTime: Double = 0
+    public var preprocessorTime: Double = 0
+    public var melInputTime: Double = 0
+    public var encoderTime: Double = 0
+    public var encoderStepCopyTime: Double = 0
+    public var decoderTime: Double = 0
+    public var jointDecisionTime: Double = 0
+    public var jointTime: Double = 0
+    public var decodeLoopTime: Double = 0
+    public var totalChunkTime: Double = 0
+
+    public init() {}
+}
+
 /// High-level manager for Nemotron Speech Streaming 0.6B pipeline.
 /// Implements true streaming with encoder cache states.
 public actor NemotronStreamingAsrManager {
@@ -54,6 +71,8 @@ public actor NemotronStreamingAsrManager {
 
     // Stats
     internal var processedChunks: Int = 0
+    internal var componentProfilingEnabled = false
+    internal var componentProfile = NemotronComponentProfile()
 
     public private(set) var mlConfiguration: MLModelConfiguration
 
@@ -72,6 +91,19 @@ public actor NemotronStreamingAsrManager {
     /// Set callback for partial transcription updates
     public func setPartialCallback(_ callback: @escaping NemotronPartialCallback) {
         self.partialCallback = callback
+    }
+
+    public func setComponentProfilingEnabled(_ enabled: Bool) {
+        componentProfilingEnabled = enabled
+        componentProfile = NemotronComponentProfile()
+    }
+
+    public func componentProfileSnapshot() -> NemotronComponentProfile {
+        componentProfile
+    }
+
+    internal func profileNow() -> Double {
+        Date.timeIntervalSinceReferenceDate
     }
 
     /// Select the runtime prompt language for multilingual Nemotron 3.5 bundles.
