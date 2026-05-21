@@ -41,6 +41,7 @@ public struct NemotronStreamingConfig: Sendable {
     public let promptDictionary: [String: Int]
     public let numPrompts: Int
     public let targetLang: String?
+    public let encoderCacheFloat16: Bool
 
     /// Audio samples per chunk
     public var chunkSamples: Int { chunkMelFrames * 160 }
@@ -69,6 +70,7 @@ public struct NemotronStreamingConfig: Sendable {
         self.promptDictionary = [:]
         self.numPrompts = 128
         self.targetLang = nil
+        self.encoderCacheFloat16 = false
     }
 
     /// Load config from metadata.json
@@ -112,6 +114,9 @@ public struct NemotronStreamingConfig: Sendable {
         self.promptDictionary = Self.parsePromptDictionary(json["prompt_dictionary"])
         self.numPrompts = json["num_prompts"] as? Int ?? 128
         self.targetLang = json["target_lang"] as? String
+        let encoderCacheIO = (coreML?["encoder_cache_io"] as? String ?? json["encoder_cache_io"] as? String ?? "FLOAT32")
+            .uppercased()
+        self.encoderCacheFloat16 = encoderCacheIO == "FLOAT16" || encoderCacheIO == "FP16"
     }
 
     private static func parsePromptDictionary(_ value: Any?) -> [String: Int] {

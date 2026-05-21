@@ -312,18 +312,24 @@ public actor NemotronStreamingAsrManager {
     }
 
     private func resetStates() throws {
+        let encoderCacheType: MLMultiArrayDataType = config.encoderCacheFloat16 ? .float16 : .float32
+
         // Encoder cache states
         cacheChannel = try MLMultiArray(
             shape: config.cacheChannelShape.map { NSNumber(value: $0) },
-            dataType: .float32
+            dataType: encoderCacheType
         )
-        cacheChannel?.reset(to: 0)
+        if let cacheChannel {
+            zeroArray(cacheChannel)
+        }
 
         cacheTime = try MLMultiArray(
             shape: config.cacheTimeShape.map { NSNumber(value: $0) },
-            dataType: .float32
+            dataType: encoderCacheType
         )
-        cacheTime?.reset(to: 0)
+        if let cacheTime {
+            zeroArray(cacheTime)
+        }
 
         cacheLen = try MLMultiArray(shape: [1], dataType: .int32)
         cacheLen?[0] = 0
@@ -345,6 +351,23 @@ public actor NemotronStreamingAsrManager {
         cState?.reset(to: 0)
 
         lastToken = Int32(config.blankIdx)
+    }
+
+    private nonisolated func zeroArray(_ array: MLMultiArray) {
+        let bytesPerElement: Int
+        switch array.dataType {
+        case .int8:
+            bytesPerElement = MemoryLayout<Int8>.stride
+        case .float16:
+            bytesPerElement = MemoryLayout<UInt16>.stride
+        case .float32, .int32:
+            bytesPerElement = MemoryLayout<UInt32>.stride
+        case .double:
+            bytesPerElement = MemoryLayout<Double>.stride
+        @unknown default:
+            bytesPerElement = MemoryLayout<Float>.stride
+        }
+        memset(array.dataPointer, 0, array.count * bytesPerElement)
     }
 
     /// Append audio buffer for processing
