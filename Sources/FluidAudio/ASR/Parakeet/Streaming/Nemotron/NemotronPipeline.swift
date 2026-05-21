@@ -5,6 +5,80 @@ import Foundation
 /// Internal processing pipeline for Nemotron streaming ASR
 /// Contains all tensor manipulation and model inference logic
 extension NemotronStreamingAsrManager {
+    private final class MutableDecoderInput: NSObject, MLFeatureProvider {
+        let token: MLMultiArray
+        let tokenLength: MLMultiArray
+        var hIn: MLMultiArray
+        var cIn: MLMultiArray
+        let tokenName: String
+        let tokenLengthName: String
+
+        init(
+            token: MLMultiArray,
+            tokenLength: MLMultiArray,
+            hIn: MLMultiArray,
+            cIn: MLMultiArray,
+            tokenName: String,
+            tokenLengthName: String
+        ) {
+            self.token = token
+            self.tokenLength = tokenLength
+            self.hIn = hIn
+            self.cIn = cIn
+            self.tokenName = tokenName
+            self.tokenLengthName = tokenLengthName
+            super.init()
+        }
+
+        var featureNames: Set<String> {
+            [tokenName, tokenLengthName, "h_in", "c_in"]
+        }
+
+        func featureValue(for featureName: String) -> MLFeatureValue? {
+            switch featureName {
+            case tokenName:
+                return MLFeatureValue(multiArray: token)
+            case tokenLengthName:
+                return MLFeatureValue(multiArray: tokenLength)
+            case "h_in":
+                return MLFeatureValue(multiArray: hIn)
+            case "c_in":
+                return MLFeatureValue(multiArray: cIn)
+            default:
+                return nil
+            }
+        }
+    }
+
+    private final class MutableJointInput: NSObject, MLFeatureProvider {
+        let encoderStep: MLMultiArray
+        var decoderStep: MLMultiArray
+        let encoderName: String
+        let decoderName: String
+
+        init(encoderStep: MLMultiArray, decoderStep: MLMultiArray, encoderName: String, decoderName: String) {
+            self.encoderStep = encoderStep
+            self.decoderStep = decoderStep
+            self.encoderName = encoderName
+            self.decoderName = decoderName
+            super.init()
+        }
+
+        var featureNames: Set<String> {
+            [encoderName, decoderName]
+        }
+
+        func featureValue(for featureName: String) -> MLFeatureValue? {
+            switch featureName {
+            case encoderName:
+                return MLFeatureValue(multiArray: encoderStep)
+            case decoderName:
+                return MLFeatureValue(multiArray: decoderStep)
+            default:
+                return nil
+            }
+        }
+    }
 
     /// Process a single audio chunk through the full pipeline
     internal func processChunk(_ samples: [Float]) async throws {
@@ -223,23 +297,39 @@ extension NemotronStreamingAsrManager {
         melCache = try extractMelCache(from: encoderMel)
         let numEncoderFrames = encoded.shape[2].intValue
         var newTokens: [Int] = []
+        let encStep = try MLMultiArray(
+            shape: [1, NSNumber(value: encoded.shape[1].intValue), 1],
+            dataType: .float32
+        )
+        let tokenInput = try MLMultiArray(shape: [1, 1], dataType: .int32)
+        let tokenLen = try MLMultiArray(shape: [1], dataType: .int32)
+        tokenLen[0] = 1
+        let decoderInput = MutableDecoderInput(
+            token: tokenInput,
+            tokenLength: tokenLen,
+            hIn: currentH,
+            cIn: currentC,
+            tokenName: "targets",
+            tokenLengthName: "target_length"
+        )
+        let decoderPlaceholder = try MLMultiArray(
+            shape: [1, NSNumber(value: config.decoderHidden), 1],
+            dataType: .float32
+        )
+        let jointInput = MutableJointInput(
+            encoderStep: encStep,
+            decoderStep: decoderPlaceholder,
+            encoderName: "encoded",
+            decoderName: "decoder"
+        )
 
         for t in 0..<numEncoderFrames {
-            let encStep = try extractEncoderStep(from: encoded, timeIndex: t)
+            try copyEncoderStep(from: encoded, timeIndex: t, into: encStep)
 
             for _ in 0..<10 {
-                let tokenInput = try MLMultiArray(shape: [1, 1], dataType: .int32)
                 tokenInput[0] = NSNumber(value: currentToken)
-
-                let tokenLen = try MLMultiArray(shape: [1], dataType: .int32)
-                tokenLen[0] = 1
-
-                let decoderInput = try MLDictionaryFeatureProvider(dictionary: [
-                    "targets": MLFeatureValue(multiArray: tokenInput),
-                    "target_length": MLFeatureValue(multiArray: tokenLen),
-                    "h_in": MLFeatureValue(multiArray: currentH),
-                    "c_in": MLFeatureValue(multiArray: currentC),
-                ])
+                decoderInput.hIn = currentH
+                decoderInput.cIn = currentC
 
                 let decoderOutput = try await decoder.prediction(from: decoderInput)
                 guard let decoderOut = decoderOutput.featureValue(for: "decoder")?.multiArrayValue,
@@ -249,10 +339,7 @@ extension NemotronStreamingAsrManager {
                     throw ASRError.processingFailed("Decoder failed")
                 }
 
-                let jointInput = try MLDictionaryFeatureProvider(dictionary: [
-                    "encoded": MLFeatureValue(multiArray: encStep),
-                    "decoder": MLFeatureValue(multiArray: decoderOut),
-                ])
+                jointInput.decoderStep = decoderOut
 
                 let jointOutput = try await joint.prediction(from: jointInput)
                 guard let logits = jointOutput.featureValue(for: "logits")?.multiArrayValue else {
@@ -302,6 +389,10 @@ extension NemotronStreamingAsrManager {
     }
 
     internal func createPromptVector() throws -> MLMultiArray {
+        if let promptVectorCache {
+            return promptVectorCache
+        }
+
         let language = activeTargetLanguage ?? config.targetLang ?? "auto"
         guard let promptIndex = config.promptDictionary[language] else {
             let available = config.promptDictionary.keys.sorted().prefix(12).joined(separator: ", ")
@@ -316,6 +407,7 @@ extension NemotronStreamingAsrManager {
         array.reset(to: 0)
         let ptr = array.dataPointer.bindMemory(to: Float.self, capacity: array.count)
         ptr[promptIndex] = 1.0
+        promptVectorCache = array
         return array
     }
 
@@ -326,24 +418,39 @@ extension NemotronStreamingAsrManager {
         )
         result.reset(to: 0)
 
+        let resultPtr = result.dataPointer.bindMemory(to: Float.self, capacity: result.count)
+        let resultStride0 = result.strides[0].intValue
+        let resultStride1 = result.strides[1].intValue
+        let resultStride2 = result.strides[2].intValue
+
         if let melCache = melCache {
             let cacheFrames = min(melCache.shape[2].intValue, config.preEncodeCache)
+            let cachePtr = melCache.dataPointer.bindMemory(to: Float.self, capacity: melCache.count)
+            let cacheStride0 = melCache.strides[0].intValue
+            let cacheStride1 = melCache.strides[1].intValue
+            let cacheStride2 = melCache.strides[2].intValue
 
             for mel in 0..<config.melFeatures {
                 for t in 0..<cacheFrames {
-                    result[[0, NSNumber(value: mel), NSNumber(value: t)]] =
-                        melCache[[0, NSNumber(value: mel), NSNumber(value: t)]]
+                    let srcIdx = 0 * cacheStride0 + mel * cacheStride1 + t * cacheStride2
+                    let dstIdx = 0 * resultStride0 + mel * resultStride1 + t * resultStride2
+                    resultPtr[dstIdx] = cachePtr[srcIdx]
                 }
             }
         }
 
         let signalFrames = processedSignal.shape[2].intValue
         let copyFrames = min(config.chunkMelFrames, signalFrames, config.totalMelFrames - config.preEncodeCache)
+        let signalPtr = processedSignal.dataPointer.bindMemory(to: Float.self, capacity: processedSignal.count)
+        let signalStride0 = processedSignal.strides[0].intValue
+        let signalStride1 = processedSignal.strides[1].intValue
+        let signalStride2 = processedSignal.strides[2].intValue
 
         for mel in 0..<config.melFeatures {
             for t in 0..<copyFrames {
-                result[[0, NSNumber(value: mel), NSNumber(value: config.preEncodeCache + t)]] =
-                    processedSignal[[0, NSNumber(value: mel), NSNumber(value: t)]]
+                let srcIdx = 0 * signalStride0 + mel * signalStride1 + t * signalStride2
+                let dstIdx = 0 * resultStride0 + mel * resultStride1 + (config.preEncodeCache + t) * resultStride2
+                resultPtr[dstIdx] = signalPtr[srcIdx]
             }
         }
 
@@ -441,7 +548,16 @@ extension NemotronStreamingAsrManager {
         // encoded: [1, 1024, T] -> step: [1, 1024, 1]
         let dim = encoded.shape[1].intValue
         let step = try MLMultiArray(shape: [1, NSNumber(value: dim), 1], dataType: .float32)
+        try copyEncoderStep(from: encoded, timeIndex: timeIndex, into: step)
+        return step
+    }
 
+    internal func copyEncoderStep(from encoded: MLMultiArray, timeIndex: Int, into step: MLMultiArray) throws {
+        // encoded: [1, C, T] -> step: [1, C, 1]
+        let dim = encoded.shape[1].intValue
+        guard step.count >= dim else {
+            throw ASRError.processingFailed("Encoder step backing is too small")
+        }
         let srcPtr = encoded.dataPointer.bindMemory(to: Float.self, capacity: encoded.count)
         let dstPtr = step.dataPointer.bindMemory(to: Float.self, capacity: step.count)
 
@@ -453,8 +569,6 @@ extension NemotronStreamingAsrManager {
             let srcIdx = 0 * stride0 + c * stride1 + timeIndex * stride2
             dstPtr[c] = srcPtr[srcIdx]
         }
-
-        return step
     }
 
     internal func sliceDecoderOutput(_ decoderOut: MLMultiArray) throws -> MLMultiArray {

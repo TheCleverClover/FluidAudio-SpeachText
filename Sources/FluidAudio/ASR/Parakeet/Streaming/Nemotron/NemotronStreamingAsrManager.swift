@@ -23,6 +23,7 @@ public actor NemotronStreamingAsrManager {
     // Configuration (loaded from metadata.json)
     public private(set) var config: NemotronStreamingConfig
     internal var activeTargetLanguage: String?
+    internal var promptVectorCache: MLMultiArray?
 
     // Audio Buffer
     private var audioBuffer: [Float] = []
@@ -63,6 +64,7 @@ public actor NemotronStreamingAsrManager {
         self.requestedChunkSize = requestedChunkSize
         self.config = NemotronStreamingConfig()
         self.activeTargetLanguage = nil
+        self.promptVectorCache = nil
         self.lastToken = Int32(config.blankIdx)
     }
 
@@ -81,6 +83,7 @@ public actor NemotronStreamingAsrManager {
             throw ASRError.processingFailed("Unknown Nemotron prompt language '\(language)'. Available: \(available)")
         }
         activeTargetLanguage = language
+        promptVectorCache = nil
     }
 
     /// Load models from a directory containing preprocessor, encoder, decoder, joint, and tokenizer
@@ -94,6 +97,7 @@ public actor NemotronStreamingAsrManager {
         if FileManager.default.fileExists(atPath: metadataPath.path) {
             self.config = try NemotronStreamingConfig(from: metadataPath)
             self.activeTargetLanguage = config.targetLang
+            self.promptVectorCache = nil
             logger.info("Loaded config: \(config.chunkMs)ms chunks, \(config.chunkMelFrames) mel frames")
         }
 
@@ -146,11 +150,102 @@ public actor NemotronStreamingAsrManager {
     }
 
     private func loadCoreMLModel(at url: URL) async throws -> MLModel {
+        let modelURL: URL
         if url.pathExtension == "mlpackage" {
-            let compiledURL = try await MLModel.compileModel(at: url)
-            return try await MLModel.load(contentsOf: compiledURL, configuration: mlConfiguration)
+            let siblingCompiled = url.deletingPathExtension().appendingPathExtension("mlmodelc")
+            if FileManager.default.fileExists(atPath: siblingCompiled.path) {
+                modelURL = siblingCompiled
+            } else {
+                modelURL = try compiledModelURL(for: url)
+            }
+        } else {
+            modelURL = url
         }
-        return try await MLModel.load(contentsOf: url, configuration: mlConfiguration)
+        return try await MLModel.load(contentsOf: modelURL, configuration: mlConfiguration)
+    }
+
+    private func compiledModelURL(for packageURL: URL) throws -> URL {
+        let fileManager = FileManager.default
+        let cacheRoot = compiledArtifactsDirectory(for: packageURL)
+        try fileManager.createDirectory(at: cacheRoot, withIntermediateDirectories: true)
+
+        let attributes = try fileManager.attributesOfItem(atPath: packageURL.path)
+        let modifiedAt = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        let baseName = packageURL.deletingPathExtension().lastPathComponent
+        let compiledName = "\(baseName)_\(computeUnitsKey(mlConfiguration.computeUnits))_\(Int64(modifiedAt * 1000)).mlmodelc"
+        let compiledURL = cacheRoot.appendingPathComponent(compiledName, isDirectory: true)
+        if fileManager.fileExists(atPath: compiledURL.path) {
+            return compiledURL
+        }
+
+        let lockURL = cacheRoot.appendingPathComponent("\(compiledName).lock", isDirectory: true)
+        while true {
+            do {
+                try fileManager.createDirectory(at: lockURL, withIntermediateDirectories: false)
+                break
+            } catch {
+                if fileManager.fileExists(atPath: lockURL.path) {
+                    Thread.sleep(forTimeInterval: 0.1)
+                    continue
+                }
+                throw error
+            }
+        }
+        defer { try? fileManager.removeItem(at: lockURL) }
+
+        if fileManager.fileExists(atPath: compiledURL.path) {
+            return compiledURL
+        }
+
+        let tempCompiledURL = try MLModel.compileModel(at: packageURL)
+        let stagedURL = cacheRoot.appendingPathComponent("\(compiledName).staging.\(UUID().uuidString)", isDirectory: true)
+        try? fileManager.removeItem(at: stagedURL)
+        try fileManager.copyItem(at: tempCompiledURL, to: stagedURL)
+
+        if fileManager.fileExists(atPath: compiledURL.path) {
+            try? fileManager.removeItem(at: stagedURL)
+            try? fileManager.removeItem(at: tempCompiledURL)
+            return compiledURL
+        }
+
+        try fileManager.moveItem(at: stagedURL, to: compiledURL)
+        try? fileManager.removeItem(at: tempCompiledURL)
+        return compiledURL
+    }
+
+    private func compiledArtifactsDirectory(for packageURL: URL) -> URL {
+        let cachesDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? packageURL.deletingLastPathComponent()
+        return cachesDirectory
+            .appendingPathComponent("FluidAudio", isDirectory: true)
+            .appendingPathComponent("CompiledNemotronModels", isDirectory: true)
+            .appendingPathComponent(stableCompiledDirectoryName(for: packageURL), isDirectory: true)
+    }
+
+    private func computeUnitsKey(_ computeUnits: MLComputeUnits) -> String {
+        switch computeUnits {
+        case .cpuOnly: return "cpu"
+        case .cpuAndGPU: return "gpu"
+        case .cpuAndNeuralEngine: return "ane"
+        case .all: return "all"
+        @unknown default: return "unknown"
+        }
+    }
+
+    private func stableCompiledDirectoryName(for packageURL: URL) -> String {
+        let path = packageURL.standardizedFileURL.path
+        let folderName = packageURL.deletingPathExtension().lastPathComponent.replacingOccurrences(of: " ", with: "_")
+        return "\(folderName)-\(fnv1a64(path))"
+    }
+
+    private func fnv1a64(_ string: String) -> String {
+        var hash: UInt64 = 0xCBF2_9CE4_8422_2325
+        let prime: UInt64 = 0x100_0000_01B3
+        for byte in string.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= prime
+        }
+        return String(hash, radix: 16, uppercase: false)
     }
 
     /// Reset all states for a new transcription session
@@ -227,6 +322,48 @@ public actor NemotronStreamingAsrManager {
         }
 
         return ""
+    }
+
+    /// Transcribe a complete buffer through the same streaming chunk path without mutating
+    /// the incremental audio queue. This keeps benchmark runs from spending time shifting
+    /// large Swift arrays while preserving the model/cache contract used for streaming.
+    public func transcribe(audioBuffer: AVAudioPCMBuffer) async throws -> String {
+        guard let tokenizer = tokenizer,
+            preprocessor != nil,
+            encoder != nil,
+            decoder != nil,
+            joint != nil
+        else {
+            throw ASRError.notInitialized
+        }
+
+        self.audioBuffer.removeAll()
+        self.accumulatedTokenIds.removeAll()
+        self.processedChunks = 0
+        try resetStates()
+
+        let samples = try audioConverter.resampleBuffer(audioBuffer)
+        guard !samples.isEmpty else {
+            return ""
+        }
+
+        var offset = 0
+        while offset < samples.count {
+            let end = min(offset + config.chunkSamples, samples.count)
+            var chunk = Array(samples[offset..<end])
+            if chunk.count < config.chunkSamples {
+                chunk.append(contentsOf: repeatElement(0.0, count: config.chunkSamples - chunk.count))
+            }
+            try await processChunk(chunk)
+            offset += config.chunkSamples
+        }
+
+        let transcript = tokenizer.decode(
+            ids: accumulatedTokenIds,
+            skipSpecialTokens: config.modelLayout == .singleEncoder
+        )
+        accumulatedTokenIds.removeAll()
+        return transcript
     }
 
     /// Finish processing and return final transcript
