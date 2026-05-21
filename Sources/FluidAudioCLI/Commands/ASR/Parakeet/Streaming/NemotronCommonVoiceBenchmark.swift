@@ -18,6 +18,7 @@ public final class NemotronCommonVoiceBenchmark {
         var targetLang: String?
         var computeUnits: String = "cpuAndNeuralEngine"
         var allowLowPrecisionGPU: Bool = true
+        var includeItems: Bool = false
         var output: URL?
 
         public init() {}
@@ -41,6 +42,21 @@ public final class NemotronCommonVoiceBenchmark {
         let audioDuration: Double
         let processingTime: Double
         let rtfx: Double
+        let items: [SampleResult]?
+    }
+
+    private struct SampleResult: Codable {
+        let sampleId: String
+        let relativePath: String
+        let reference: String
+        let hypothesis: String
+        let wer: Double
+        let insertions: Int
+        let deletions: Int
+        let substitutions: Int
+        let totalWords: Int
+        let audioDuration: Double
+        let processingTime: Double
     }
 
     private struct FileResult {
@@ -134,6 +150,8 @@ public final class NemotronCommonVoiceBenchmark {
                 }
             case "--disable-low-precision-gpu":
                 config.allowLowPrecisionGPU = false
+            case "--include-items":
+                config.includeItems = true
             case "--output", "-o":
                 i += 1
                 if i < arguments.count {
@@ -170,6 +188,7 @@ public final class NemotronCommonVoiceBenchmark {
                 --target-lang <lang>      Runtime prompt language (default: language)
                 --compute-units <units>   cpuAndNeuralEngine, all, cpuAndGPU, cpuOnly (default: cpuAndNeuralEngine)
                 --disable-low-precision-gpu
+                --include-items           Include per-file hypotheses and metrics in JSON output
                 --output, -o <path>       JSON output path
                 --help, -h                Show this help
 
@@ -226,6 +245,10 @@ public final class NemotronCommonVoiceBenchmark {
             var totalSubstitutions = 0
             var totalAudioDuration: Double = 0
             var totalProcessingTime: Double = 0
+            var itemResults: [SampleResult] = []
+            if config.includeItems {
+                itemResults.reserveCapacity(filesToProcess.count)
+            }
 
             let progressInterval = max(1, filesToProcess.count / 20)
 
@@ -249,6 +272,24 @@ public final class NemotronCommonVoiceBenchmark {
                     totalAudioDuration += result.audioDuration
                     totalProcessingTime += result.processingTime
                     filesProcessed += 1
+
+                    if config.includeItems {
+                        itemResults.append(
+                            SampleResult(
+                                sampleId: sample.sampleId,
+                                relativePath: sample.relativePath,
+                                reference: sample.transcript,
+                                hypothesis: result.hypothesis,
+                                wer: result.metrics.wer,
+                                insertions: result.metrics.insertions,
+                                deletions: result.metrics.deletions,
+                                substitutions: result.metrics.substitutions,
+                                totalWords: result.metrics.totalWords,
+                                audioDuration: result.audioDuration,
+                                processingTime: result.processingTime
+                            )
+                        )
+                    }
 
                     if filesProcessed == 1 || filesProcessed % progressInterval == 0 || index == filesToProcess.count - 1
                     {
@@ -299,7 +340,8 @@ public final class NemotronCommonVoiceBenchmark {
                 wer: wer,
                 audioDuration: totalAudioDuration,
                 processingTime: totalProcessingTime,
-                rtfx: rtfx
+                rtfx: rtfx,
+                items: config.includeItems ? itemResults : nil
             )
 
             let outputURL = config.output ?? defaultOutputURL(language: config.language, split: config.split)

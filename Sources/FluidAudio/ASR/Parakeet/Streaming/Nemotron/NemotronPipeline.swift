@@ -233,13 +233,15 @@ extension NemotronStreamingAsrManager {
         guard let preprocessor = preprocessor,
             let encoder = encoder,
             let decoder = decoder,
-            let joint = joint,
             let cacheChannel = cacheChannel,
             let cacheTime = cacheTime,
             let cacheLen = cacheLen,
             var currentH = hState,
             var currentC = cState
         else {
+            throw ASRError.notInitialized
+        }
+        guard joint != nil || jointDecision != nil else {
             throw ASRError.notInitialized
         }
 
@@ -341,12 +343,24 @@ extension NemotronStreamingAsrManager {
 
                 jointInput.decoderStep = decoderOut
 
-                let jointOutput = try await joint.prediction(from: jointInput)
-                guard let logits = jointOutput.featureValue(for: "logits")?.multiArrayValue else {
-                    throw ASRError.processingFailed("Joint failed")
+                let predToken: Int
+                if let jointDecision {
+                    let decisionOutput = try await jointDecision.prediction(from: jointInput)
+                    guard let tokenId = decisionOutput.featureValue(for: "token_id")?.multiArrayValue else {
+                        throw ASRError.processingFailed("Joint decision failed")
+                    }
+                    predToken = tokenId[0].intValue
+                } else {
+                    guard let joint else {
+                        throw ASRError.processingFailed("Missing joint model")
+                    }
+                    let jointOutput = try await joint.prediction(from: jointInput)
+                    guard let logits = jointOutput.featureValue(for: "logits")?.multiArrayValue else {
+                        throw ASRError.processingFailed("Joint failed")
+                    }
+                    predToken = findMaxIndex(logits)
                 }
 
-                let predToken = findMaxIndex(logits)
                 if predToken == config.blankIdx {
                     break
                 }

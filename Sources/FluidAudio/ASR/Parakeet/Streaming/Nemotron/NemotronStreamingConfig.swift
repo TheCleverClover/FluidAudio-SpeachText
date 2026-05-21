@@ -16,6 +16,8 @@ public struct NemotronStreamingConfig: Sendable {
     public let chunkMelFrames: Int
     /// Chunk duration in milliseconds
     public let chunkMs: Int
+    /// Mel frames to advance after each processed chunk
+    public let shiftMelFrames: Int
     /// Pre-encode cache size in mel frames (for encoder context)
     public let preEncodeCache: Int
     /// Total mel frames for encoder input (cache + chunk)
@@ -42,6 +44,8 @@ public struct NemotronStreamingConfig: Sendable {
 
     /// Audio samples per chunk
     public var chunkSamples: Int { chunkMelFrames * 160 }
+    /// Audio samples to advance after each processed chunk
+    public var shiftSamples: Int { shiftMelFrames * 160 }
 
     /// Default config for 1120ms chunks (backward compatibility)
     public init() {
@@ -49,6 +53,7 @@ public struct NemotronStreamingConfig: Sendable {
         self.melFeatures = 128
         self.chunkMelFrames = 112
         self.chunkMs = 1120
+        self.shiftMelFrames = 112
         self.preEncodeCache = 9
         self.totalMelFrames = 121
         self.vocabSize = 1024
@@ -82,10 +87,14 @@ public struct NemotronStreamingConfig: Sendable {
         let totalMelFrames = json["total_mel_frames"] as? Int ?? processedStepShape?[2] ?? 121
         let chunkMelFrames = json["chunk_mel_frames"] as? Int
             ?? (singleEncoder ? max(totalMelFrames - preEncodeCache, 1) : 112)
+        let streaming = json["streaming"] as? [String: Any]
+        let shiftSize = streaming?["shift_size"] as? [Int]
+        let shiftMelFrames = json["shift_mel_frames"] as? Int ?? shiftSize?.last ?? chunkMelFrames
         self.sampleRate = json["sample_rate"] as? Int ?? 16000
         self.melFeatures = json["mel_features"] as? Int ?? processedStepShape?[1] ?? 128
         self.chunkMelFrames = chunkMelFrames
-        self.chunkMs = json["chunk_ms"] as? Int ?? (chunkMelFrames * 10)
+        self.chunkMs = json["chunk_ms"] as? Int ?? (shiftMelFrames * 10)
+        self.shiftMelFrames = shiftMelFrames
         self.preEncodeCache = preEncodeCache
         self.totalMelFrames = totalMelFrames
         self.vocabSize = json["vocab_size"] as? Int ?? 1024

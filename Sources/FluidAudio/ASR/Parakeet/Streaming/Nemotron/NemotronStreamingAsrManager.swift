@@ -15,6 +15,7 @@ public actor NemotronStreamingAsrManager {
     internal var encoder: MLModel?
     internal var decoder: MLModel?
     internal var joint: MLModel?
+    internal var jointDecision: MLModel?
 
     // Components
     private let audioConverter = AudioConverter()
@@ -123,12 +124,23 @@ public actor NemotronStreamingAsrManager {
         )
         self.decoder = try await loadCoreMLModel(at: decoderPath)
 
-        // Load joint
-        let jointPath = try resolveModelURL(
+        if let jointPath = resolveOptionalModelURL(
             in: modelDir,
             candidates: [ModelNames.NemotronStreaming.jointFile, "joint.mlpackage"]
-        )
-        self.joint = try await loadCoreMLModel(at: jointPath)
+        ) {
+            self.joint = try await loadCoreMLModel(at: jointPath)
+        }
+
+        if let jointDecisionPath = resolveOptionalModelURL(
+            in: modelDir,
+            candidates: ["joint_decision.mlmodelc", "joint_decision.mlpackage"]
+        ) {
+            self.jointDecision = try await loadCoreMLModel(at: jointDecisionPath)
+        }
+
+        guard self.joint != nil || self.jointDecision != nil else {
+            throw ASRError.processingFailed("Missing model file: joint or joint_decision")
+        }
 
         // Load tokenizer
         self.tokenizer = try Tokenizer(modelDirectory: modelDir)
@@ -136,17 +148,24 @@ public actor NemotronStreamingAsrManager {
         // Initialize states
         try resetStates()
 
-        logger.info("Nemotron models loaded successfully (\(config.chunkMs)ms chunks).")
+        logger.info("Nemotron models loaded successfully (\(config.chunkMs)ms shift, \(config.chunkMelFrames * 10)ms window).")
     }
 
     private func resolveModelURL(in modelDir: URL, candidates: [String]) throws -> URL {
+        if let url = resolveOptionalModelURL(in: modelDir, candidates: candidates) {
+            return url
+        }
+        throw ASRError.processingFailed("Missing model file: \(candidates.joined(separator: " or "))")
+    }
+
+    private func resolveOptionalModelURL(in modelDir: URL, candidates: [String]) -> URL? {
         for candidate in candidates {
             let url = modelDir.appendingPathComponent(candidate)
             if FileManager.default.fileExists(atPath: url.path) {
                 return url
             }
         }
-        throw ASRError.processingFailed("Missing model file: \(candidates.joined(separator: " or "))")
+        return nil
     }
 
     private func loadCoreMLModel(at url: URL) async throws -> MLModel {
@@ -305,7 +324,7 @@ public actor NemotronStreamingAsrManager {
     /// Process audio and return partial transcript
     public func process(audioBuffer: AVAudioPCMBuffer) async throws -> String {
         // Check if models are loaded
-        guard preprocessor != nil, encoder != nil, decoder != nil, joint != nil else {
+        guard preprocessor != nil, encoder != nil, decoder != nil, (joint != nil || jointDecision != nil) else {
             throw ASRError.notInitialized
         }
 
@@ -317,7 +336,7 @@ public actor NemotronStreamingAsrManager {
             let chunk = Array(self.audioBuffer.prefix(config.chunkSamples))
             try await processChunk(chunk)
             // Recheck buffer count after await to handle actor reentrancy
-            let samplesToRemove = min(config.chunkSamples, self.audioBuffer.count)
+            let samplesToRemove = min(config.shiftSamples, self.audioBuffer.count)
             self.audioBuffer.removeFirst(samplesToRemove)
         }
 
@@ -332,7 +351,7 @@ public actor NemotronStreamingAsrManager {
             preprocessor != nil,
             encoder != nil,
             decoder != nil,
-            joint != nil
+            (joint != nil || jointDecision != nil)
         else {
             throw ASRError.notInitialized
         }
@@ -355,7 +374,7 @@ public actor NemotronStreamingAsrManager {
                 chunk.append(contentsOf: repeatElement(0.0, count: config.chunkSamples - chunk.count))
             }
             try await processChunk(chunk)
-            offset += config.chunkSamples
+            offset += config.shiftSamples
         }
 
         let transcript = tokenizer.decode(
@@ -373,7 +392,7 @@ public actor NemotronStreamingAsrManager {
             preprocessor != nil,
             encoder != nil,
             decoder != nil,
-            joint != nil
+            (joint != nil || jointDecision != nil)
         else {
             throw ASRError.notInitialized
         }
@@ -438,14 +457,14 @@ extension NemotronStreamingAsrManager: StreamingAsrEngine {
     }
 
     public func processBufferedAudio() async throws {
-        guard preprocessor != nil, encoder != nil, decoder != nil, joint != nil else {
+        guard preprocessor != nil, encoder != nil, decoder != nil, (joint != nil || jointDecision != nil) else {
             throw ASRError.notInitialized
         }
 
         while audioBuffer.count >= config.chunkSamples {
             let chunk = Array(audioBuffer.prefix(config.chunkSamples))
             try await processChunk(chunk)
-            let samplesToRemove = min(config.chunkSamples, audioBuffer.count)
+            let samplesToRemove = min(config.shiftSamples, audioBuffer.count)
             audioBuffer.removeFirst(samplesToRemove)
         }
     }
