@@ -1,5 +1,6 @@
 #if os(macOS)
 import AVFoundation
+@preconcurrency import CoreML
 import FluidAudio
 import Foundation
 
@@ -14,6 +15,7 @@ public class NemotronBenchmark {
         var chunkSize: NemotronChunkSize = .ms1120
         var requestedChunkMs: Int?
         var targetLang: String?
+        var computeUnits: String = "cpuAndNeuralEngine"
         var profileComponents = false
 
         public init() {}
@@ -82,6 +84,11 @@ public class NemotronBenchmark {
                 if i < arguments.count {
                     config.targetLang = arguments[i]
                 }
+            case "--compute-units":
+                i += 1
+                if i < arguments.count {
+                    config.computeUnits = arguments[i]
+                }
             case "--profile-components":
                 config.profileComponents = true
             case "--help", "-h":
@@ -110,6 +117,7 @@ public class NemotronBenchmark {
                 --model-dir, -m <path>    Path to Nemotron CoreML models
                 --chunk, -c <ms>          Chunk size: 1120, 560, or 320 with --model-dir (default: 1120)
                 --target-lang <lang>      Runtime prompt language for multilingual bundles
+                --compute-units <units>   all, cpuAndNeuralEngine, cpuAndGPU, cpuOnly (default: cpuAndNeuralEngine)
                 --profile-components      Emit per-stage Nemotron timing JSON and Instruments signposts
                 --help, -h                Show this help
 
@@ -153,7 +161,7 @@ public class NemotronBenchmark {
 
             // 3. Load models
             logger.info("Loading Nemotron models...")
-            let manager = NemotronStreamingAsrManager()
+            let manager = try NemotronStreamingAsrManager(configuration: makeModelConfiguration())
             try await manager.loadModels(modelDir: modelDir)
             if config.profileComponents {
                 await manager.setComponentProfilingEnabled(true)
@@ -165,6 +173,7 @@ public class NemotronBenchmark {
             }
             let loadedChunkMs = await manager.config.chunkMs
             logger.info("Models loaded successfully (\(loadedChunkMs)ms chunks)")
+            logger.info("Compute units: \(config.computeUnits)")
 
             // 4. Get audio files
             let datasetPath = getLibriSpeechDirectory().appendingPathComponent(config.subset)
@@ -293,6 +302,23 @@ public class NemotronBenchmark {
         logger.info("Joint decision:     \(String(format: "%.2f", profile.jointDecisionTime * 1000)) ms total, \(String(format: "%.3f", profile.jointDecisionTime * 1000 / Double(decodeSteps))) ms/step")
         logger.info("Joint full:         \(String(format: "%.2f", profile.jointTime * 1000)) ms total")
         logger.info("Decode loop:        \(String(format: "%.2f", profile.decodeLoopTime * 1000)) ms")
+    }
+
+    private func makeModelConfiguration() throws -> MLModelConfiguration {
+        let mlConfig = NemotronStreamingAsrManager.defaultModelConfiguration()
+        switch config.computeUnits.lowercased() {
+        case "all":
+            mlConfig.computeUnits = .all
+        case "cpuandneuralengine", "cpu-ne", "ane":
+            mlConfig.computeUnits = .cpuAndNeuralEngine
+        case "cpuandgpu", "cpu-gpu", "gpu":
+            mlConfig.computeUnits = .cpuAndGPU
+        case "cpuonly", "cpu":
+            mlConfig.computeUnits = .cpuOnly
+        default:
+            throw ASRError.processingFailed("Unknown compute units: \(config.computeUnits)")
+        }
+        return mlConfig
     }
 
     /// Run transcription on custom input files

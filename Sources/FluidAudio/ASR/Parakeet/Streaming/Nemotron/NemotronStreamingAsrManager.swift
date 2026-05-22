@@ -79,8 +79,14 @@ public actor NemotronStreamingAsrManager {
 
     public private(set) var mlConfiguration: MLModelConfiguration
 
+    public static func defaultModelConfiguration() -> MLModelConfiguration {
+        let configuration = MLModelConfiguration()
+        configuration.computeUnits = .cpuAndNeuralEngine
+        return configuration
+    }
+
     public init(
-        configuration: MLModelConfiguration = MLModelConfiguration(),
+        configuration: MLModelConfiguration = NemotronStreamingAsrManager.defaultModelConfiguration(),
         requestedChunkSize: NemotronChunkSize? = nil
     ) {
         self.mlConfiguration = configuration

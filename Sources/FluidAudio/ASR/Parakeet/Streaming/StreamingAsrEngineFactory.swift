@@ -52,7 +52,7 @@ public enum StreamingAsrEngineFactory {
         variant: StreamingModelVariant,
         configuration: MLModelConfiguration?
     ) -> NemotronStreamingAsrManager {
-        let mlConfig = configuration ?? MLModelConfiguration()
+        let mlConfig = configuration ?? NemotronStreamingAsrManager.defaultModelConfiguration()
         let chunkSize = variant.nemotronChunkSize ?? .ms1120
         return NemotronStreamingAsrManager(configuration: mlConfig, requestedChunkSize: chunkSize)
     }
