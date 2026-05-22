@@ -12,6 +12,7 @@ public class NemotronBenchmark {
         var subset: String = "test-clean"
         var modelDir: URL?
         var chunkSize: NemotronChunkSize = .ms1120
+        var requestedChunkMs: Int?
         var targetLang: String?
 
         public init() {}
@@ -64,11 +65,14 @@ public class NemotronBenchmark {
             case "--chunk", "-c":
                 i += 1
                 if i < arguments.count, let ms = Int(arguments[i]) {
+                    config.requestedChunkMs = ms
                     switch ms {
                     case 1120: config.chunkSize = .ms1120
                     case 560: config.chunkSize = .ms560
+                    case 320:
+                        break
                     default:
-                        logger.warning("Invalid chunk size: \(ms)ms. Valid options: 1120 or 560. Using default 1120ms.")
+                        logger.warning("Invalid chunk size: \(ms)ms. Valid options: 1120, 560, or 320 with --model-dir. Using default 1120ms.")
                     }
                 }
             case "--target-lang":
@@ -100,17 +104,19 @@ public class NemotronBenchmark {
                 --max-files, -n <count>   Maximum files to process (default: all)
                 --subset, -s <name>       LibriSpeech subset (default: test-clean)
                 --model-dir, -m <path>    Path to Nemotron CoreML models
-                --chunk, -c <ms>          Chunk size: 1120 or 560 (default: 1120)
+                --chunk, -c <ms>          Chunk size: 1120, 560, or 320 with --model-dir (default: 1120)
                 --target-lang <lang>      Runtime prompt language for multilingual bundles
                 --help, -h                Show this help
 
             Chunk Sizes:
                 1120ms  Original chunk size (1.12s) - best accuracy & speed (WER: 0.59%)
                 560ms   Half chunk size (0.56s) - lower latency, same accuracy (WER: 0.59%)
+                320ms   Local converted Nemotron 3.5 bundle; requires --model-dir
 
             Examples:
                 fluidaudio nemotron-benchmark --max-files 100
                 fluidaudio nemotron-benchmark --chunk 560 --max-files 50
+                fluidaudio nemotron-benchmark --chunk 320 --model-dir ./coreml_projected_kv_320_smoke --max-files 50
 
             Note: To transcribe custom audio files, use 'nemotron-transcribe' instead.
             """
@@ -120,7 +126,8 @@ public class NemotronBenchmark {
     /// Run the benchmark
     public func run() async {
         logger.info(String(repeating: "=", count: 70))
-        logger.info("NEMOTRON SPEECH STREAMING 0.6B BENCHMARK (\(config.chunkSize.rawValue)ms chunks)")
+        let chunkLabel = config.requestedChunkMs ?? config.chunkSize.rawValue
+        logger.info("NEMOTRON SPEECH STREAMING 0.6B BENCHMARK (\(chunkLabel)ms requested)")
         logger.info(String(repeating: "=", count: 70))
 
         #if DEBUG
@@ -386,6 +393,9 @@ public class NemotronBenchmark {
     private func getOrDownloadModels() async throws -> URL {
         if let modelDir = config.modelDir {
             return modelDir
+        }
+        if let requestedChunkMs = config.requestedChunkMs, requestedChunkMs != 1120 && requestedChunkMs != 560 {
+            throw ASRError.processingFailed("\(requestedChunkMs)ms Nemotron chunks require --model-dir with a matching metadata.json")
         }
 
         let repo = config.chunkSize.repo

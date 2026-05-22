@@ -233,7 +233,6 @@ extension NemotronStreamingAsrManager {
         guard let preprocessor = preprocessor,
             let encoder = encoder,
             let decoder = decoder,
-            let cacheChannel = cacheChannel,
             let cacheTime = cacheTime,
             let cacheLen = cacheLen,
             var currentH = hState,
@@ -283,10 +282,15 @@ extension NemotronStreamingAsrManager {
         var encoderFeatures: [String: MLFeatureValue] = [
             "processed_signal": MLFeatureValue(multiArray: encoderMel),
             "processed_signal_length": MLFeatureValue(multiArray: melLen),
-            "cache_last_channel": MLFeatureValue(multiArray: cacheChannel),
             "cache_last_time": MLFeatureValue(multiArray: cacheTime),
             "cache_last_channel_len": MLFeatureValue(multiArray: cacheLen),
         ]
+        if !config.encoderStateful {
+            guard let cacheChannel = cacheChannel else {
+                throw ASRError.notInitialized
+            }
+            encoderFeatures["cache_last_channel"] = MLFeatureValue(multiArray: cacheChannel)
+        }
         if config.runtimePrompt {
             encoderFeatures["prompt_vector"] = MLFeatureValue(multiArray: try createPromptVector())
         }
@@ -296,7 +300,18 @@ extension NemotronStreamingAsrManager {
         }
 
         let encoderStartedAt = shouldProfile ? profileNow() : 0
-        let encoderOutput = try await encoder.prediction(from: encoderInput)
+        let encoderOutput: MLFeatureProvider
+        if config.encoderStateful {
+            guard #available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *) else {
+                throw ASRError.processingFailed("Stateful Nemotron encoder requires macOS 15/iOS 18 or newer")
+            }
+            guard let encoderState = encoderState as? MLState else {
+                throw ASRError.notInitialized
+            }
+            encoderOutput = try await encoder.prediction(from: encoderInput, using: encoderState)
+        } else {
+            encoderOutput = try await encoder.prediction(from: encoderInput)
+        }
         if shouldProfile {
             componentProfile.encoderTime += profileNow() - encoderStartedAt
         }

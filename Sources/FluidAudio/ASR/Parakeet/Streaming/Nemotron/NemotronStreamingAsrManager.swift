@@ -53,6 +53,7 @@ public actor NemotronStreamingAsrManager {
     internal var cacheChannel: MLMultiArray?
     internal var cacheTime: MLMultiArray?
     internal var cacheLen: MLMultiArray?
+    internal var encoderState: Any?
 
     // Mel cache (last 9 frames from previous chunk)
     internal var melCache: MLMultiArray?
@@ -315,12 +316,21 @@ public actor NemotronStreamingAsrManager {
         let encoderCacheType: MLMultiArrayDataType = config.encoderCacheFloat16 ? .float16 : .float32
 
         // Encoder cache states
-        cacheChannel = try MLMultiArray(
-            shape: config.cacheChannelShape.map { NSNumber(value: $0) },
-            dataType: encoderCacheType
-        )
-        if let cacheChannel {
-            zeroArray(cacheChannel)
+        if config.encoderStateful {
+            guard #available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *) else {
+                throw ASRError.processingFailed("Stateful Nemotron encoder requires macOS 15/iOS 18 or newer")
+            }
+            cacheChannel = nil
+            encoderState = encoder?.makeState()
+        } else {
+            encoderState = nil
+            cacheChannel = try MLMultiArray(
+                shape: config.cacheChannelShape.map { NSNumber(value: $0) },
+                dataType: encoderCacheType
+            )
+            if let cacheChannel {
+                zeroArray(cacheChannel)
+            }
         }
 
         cacheTime = try MLMultiArray(

@@ -11,6 +11,7 @@ public class NemotronTranscribe {
         var inputFiles: [URL] = []
         var modelDir: URL?
         var chunkSize: NemotronChunkSize = .ms1120
+        var requestedChunkMs: Int?
         var targetLang: String?
 
         public init() {}
@@ -49,11 +50,14 @@ public class NemotronTranscribe {
             case "--chunk", "-c":
                 i += 1
                 if i < arguments.count, let ms = Int(arguments[i]) {
+                    config.requestedChunkMs = ms
                     switch ms {
                     case 1120: config.chunkSize = .ms1120
                     case 560: config.chunkSize = .ms560
+                    case 320:
+                        break
                     default:
-                        logger.warning("Invalid chunk size: \(ms)ms. Valid options: 1120 or 560. Using default 1120ms.")
+                        logger.warning("Invalid chunk size: \(ms)ms. Valid options: 1120, 560, or 320 with --model-dir. Using default 1120ms.")
                     }
                 }
             case "--target-lang":
@@ -90,13 +94,14 @@ public class NemotronTranscribe {
             Options:
                 --input, -i <path>        Audio file to transcribe (.wav) - required, can be used multiple times
                 --model-dir, -m <path>    Path to Nemotron CoreML models (optional, auto-downloads if not provided)
-                --chunk, -c <ms>          Chunk size: 1120 or 560 (default: 1120)
+                --chunk, -c <ms>          Chunk size: 1120, 560, or 320 with --model-dir (default: 1120)
                 --target-lang <lang>      Runtime prompt language for multilingual bundles (for example pt-BR)
                 --help, -h                Show this help
 
             Chunk Sizes:
                 1120ms  Original chunk size (1.12s) - best accuracy & speed (WER: 0.59%)
                 560ms   Half chunk size (0.56s) - lower latency, same accuracy (WER: 0.59%)
+                320ms   Local converted Nemotron 3.5 bundle; requires --model-dir
 
             Examples:
                 # Transcribe a single file
@@ -104,6 +109,9 @@ public class NemotronTranscribe {
 
                 # Transcribe multiple files with 560ms chunks
                 fluidaudio nemotron-transcribe -i file1.wav -i file2.wav --chunk 560
+
+                # Use a local 320ms converted bundle
+                fluidaudio nemotron-transcribe --input audio.wav --chunk 320 --model-dir ~/my-320ms-models
 
                 # Use custom model directory
                 fluidaudio nemotron-transcribe --input audio.wav --model-dir ~/my-models
@@ -202,6 +210,9 @@ public class NemotronTranscribe {
     private func getOrDownloadModels() async throws -> URL {
         if let modelDir = config.modelDir {
             return modelDir
+        }
+        if let requestedChunkMs = config.requestedChunkMs, requestedChunkMs != 1120 && requestedChunkMs != 560 {
+            throw ASRError.processingFailed("\(requestedChunkMs)ms Nemotron chunks require --model-dir with a matching metadata.json")
         }
 
         let repo = config.chunkSize.repo

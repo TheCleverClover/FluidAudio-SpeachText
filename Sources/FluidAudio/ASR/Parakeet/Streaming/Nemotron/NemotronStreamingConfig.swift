@@ -42,6 +42,8 @@ public struct NemotronStreamingConfig: Sendable {
     public let numPrompts: Int
     public let targetLang: String?
     public let encoderCacheFloat16: Bool
+    public let encoderStateful: Bool
+    public let encoderProjectedKVCache: Bool
 
     /// Audio samples per chunk
     public var chunkSamples: Int { chunkMelFrames * 160 }
@@ -71,6 +73,8 @@ public struct NemotronStreamingConfig: Sendable {
         self.numPrompts = 128
         self.targetLang = nil
         self.encoderCacheFloat16 = false
+        self.encoderStateful = false
+        self.encoderProjectedKVCache = false
     }
 
     /// Load config from metadata.json
@@ -117,6 +121,13 @@ public struct NemotronStreamingConfig: Sendable {
         let encoderCacheIO = (coreML?["encoder_cache_io"] as? String ?? json["encoder_cache_io"] as? String ?? "FLOAT32")
             .uppercased()
         self.encoderCacheFloat16 = encoderCacheIO == "FLOAT16" || encoderCacheIO == "FP16"
+        self.encoderStateful = coreML?["encoder_stateful"] as? Bool
+            ?? coreML?["encoder_projected_kv_cache"] as? Bool
+            ?? json["encoder_projected_kv_cache"] as? Bool
+            ?? false
+        self.encoderProjectedKVCache = coreML?["encoder_projected_kv_cache"] as? Bool
+            ?? json["encoder_projected_kv_cache"] as? Bool
+            ?? false
     }
 
     private static func parsePromptDictionary(_ value: Any?) -> [String: Int] {
