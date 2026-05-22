@@ -1,6 +1,7 @@
 import AVFoundation
 @preconcurrency import CoreML
 import Foundation
+import os
 
 /// Callback invoked when new tokens are decoded (for live transcription updates)
 public typealias NemotronPartialCallback = @Sendable (String) -> Void
@@ -26,6 +27,7 @@ public struct NemotronComponentProfile: Codable, Sendable {
 /// Implements true streaming with encoder cache states.
 public actor NemotronStreamingAsrManager {
     private let logger = AppLogger(category: "NemotronStreaming")
+    private let signposter = OSSignposter(subsystem: AppLogger.defaultSubsystem, category: .pointsOfInterest)
 
     // Models
     internal var preprocessor: MLModel?
@@ -105,6 +107,16 @@ public actor NemotronStreamingAsrManager {
 
     internal func profileNow() -> Double {
         Date.timeIntervalSinceReferenceDate
+    }
+
+    internal func beginProfileInterval(_ name: StaticString) -> OSSignpostIntervalState? {
+        guard componentProfilingEnabled else { return nil }
+        return signposter.beginInterval(name, id: signposter.makeSignpostID())
+    }
+
+    internal func endProfileInterval(_ name: StaticString, _ state: OSSignpostIntervalState?) {
+        guard let state else { return }
+        signposter.endInterval(name, state)
     }
 
     /// Select the runtime prompt language for multilingual Nemotron 3.5 bundles.

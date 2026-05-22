@@ -14,6 +14,7 @@ public class NemotronBenchmark {
         var chunkSize: NemotronChunkSize = .ms1120
         var requestedChunkMs: Int?
         var targetLang: String?
+        var profileComponents = false
 
         public init() {}
     }
@@ -27,6 +28,7 @@ public class NemotronBenchmark {
         let audioDuration: Double
         let processingTime: Double
         let rtfx: Double
+        let componentProfile: NemotronComponentProfile?
     }
 
     private let config: Config
@@ -80,6 +82,8 @@ public class NemotronBenchmark {
                 if i < arguments.count {
                     config.targetLang = arguments[i]
                 }
+            case "--profile-components":
+                config.profileComponents = true
             case "--help", "-h":
                 printUsage()
                 return
@@ -106,6 +110,7 @@ public class NemotronBenchmark {
                 --model-dir, -m <path>    Path to Nemotron CoreML models
                 --chunk, -c <ms>          Chunk size: 1120, 560, or 320 with --model-dir (default: 1120)
                 --target-lang <lang>      Runtime prompt language for multilingual bundles
+                --profile-components      Emit per-stage Nemotron timing JSON and Instruments signposts
                 --help, -h                Show this help
 
             Chunk Sizes:
@@ -150,6 +155,10 @@ public class NemotronBenchmark {
             logger.info("Loading Nemotron models...")
             let manager = NemotronStreamingAsrManager()
             try await manager.loadModels(modelDir: modelDir)
+            if config.profileComponents {
+                await manager.setComponentProfilingEnabled(true)
+                logger.info("Component profiling enabled")
+            }
             if let targetLang = config.targetLang {
                 try await manager.setTargetLanguage(targetLang)
                 logger.info("Runtime prompt language: \(targetLang)")
@@ -229,6 +238,11 @@ public class NemotronBenchmark {
             logger.info("Processing time:    \(String(format: "%.1f", totalProcessingTime))s")
             logger.info("RTFx:               \(String(format: "%.1f", rtfx))x")
 
+            let componentProfile = config.profileComponents ? await manager.componentProfileSnapshot() : nil
+            if let componentProfile {
+                logComponentProfile(componentProfile, audioDuration: totalAudioDuration)
+            }
+
             // Save JSON results
             let jsonOutput = BenchmarkResults(
                 chunkSize: loadedChunkMs,
@@ -238,7 +252,8 @@ public class NemotronBenchmark {
                 wer: finalWer,
                 audioDuration: totalAudioDuration,
                 processingTime: totalProcessingTime,
-                rtfx: rtfx
+                rtfx: rtfx,
+                componentProfile: componentProfile
             )
 
             do {
@@ -255,6 +270,29 @@ public class NemotronBenchmark {
         } catch {
             logger.error("Benchmark failed: \(error)")
         }
+    }
+
+    private func logComponentProfile(_ profile: NemotronComponentProfile, audioDuration: Double) {
+        let chunkCount = max(profile.chunks, 1)
+        let decodeSteps = max(profile.decodeSteps, 1)
+        let totalMs = profile.totalChunkTime * 1000
+        let rtfx = profile.totalChunkTime > 0 ? audioDuration / profile.totalChunkTime : 0
+
+        logger.info("")
+        logger.info("COMPONENT PROFILE")
+        logger.info("Chunks:             \(profile.chunks)")
+        logger.info("Decode steps:       \(profile.decodeSteps)")
+        logger.info("Profiled chunk ms:  \(String(format: "%.2f", totalMs)) total, \(String(format: "%.2f", totalMs / Double(chunkCount))) avg")
+        logger.info("Profiled RTFx:      \(String(format: "%.2f", rtfx))x")
+        logger.info("Audio input:        \(String(format: "%.2f", profile.audioInputTime * 1000)) ms")
+        logger.info("Preprocessor:       \(String(format: "%.2f", profile.preprocessorTime * 1000)) ms")
+        logger.info("Mel input:          \(String(format: "%.2f", profile.melInputTime * 1000)) ms")
+        logger.info("Encoder:            \(String(format: "%.2f", profile.encoderTime * 1000)) ms")
+        logger.info("Encoder step copy:  \(String(format: "%.2f", profile.encoderStepCopyTime * 1000)) ms")
+        logger.info("Decoder:            \(String(format: "%.2f", profile.decoderTime * 1000)) ms total, \(String(format: "%.3f", profile.decoderTime * 1000 / Double(decodeSteps))) ms/step")
+        logger.info("Joint decision:     \(String(format: "%.2f", profile.jointDecisionTime * 1000)) ms total, \(String(format: "%.3f", profile.jointDecisionTime * 1000 / Double(decodeSteps))) ms/step")
+        logger.info("Joint full:         \(String(format: "%.2f", profile.jointTime * 1000)) ms total")
+        logger.info("Decode loop:        \(String(format: "%.2f", profile.decodeLoopTime * 1000)) ms")
     }
 
     /// Run transcription on custom input files

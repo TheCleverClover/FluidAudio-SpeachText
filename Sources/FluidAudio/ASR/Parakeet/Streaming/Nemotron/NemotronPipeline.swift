@@ -245,9 +245,12 @@ extension NemotronStreamingAsrManager {
         }
 
         let shouldProfile = componentProfilingEnabled
+        let chunkInterval = beginProfileInterval("Nemotron.Chunk")
+        defer { endProfileInterval("Nemotron.Chunk", chunkInterval) }
         let chunkStartedAt = shouldProfile ? profileNow() : 0
         var currentToken = lastToken
         let audioStartedAt = shouldProfile ? profileNow() : 0
+        let audioInterval = beginProfileInterval("Nemotron.AudioInput")
         let audioArray: MLMultiArray
         if let maxAudioSamples = config.maxAudioSamples {
             audioArray = try createPaddedAudioArray(samples, count: maxAudioSamples)
@@ -264,17 +267,21 @@ extension NemotronStreamingAsrManager {
         if shouldProfile {
             componentProfile.audioInputTime += profileNow() - audioStartedAt
         }
+        endProfileInterval("Nemotron.AudioInput", audioInterval)
 
         let preprocessorStartedAt = shouldProfile ? profileNow() : 0
+        let preprocessorInterval = beginProfileInterval("Nemotron.Preprocessor")
         let preprocOutput = try await preprocessor.prediction(from: preprocInput)
         if shouldProfile {
             componentProfile.preprocessorTime += profileNow() - preprocessorStartedAt
         }
+        endProfileInterval("Nemotron.Preprocessor", preprocessorInterval)
         guard let processedSignal = preprocOutput.featureValue(for: "processed_signal")?.multiArrayValue else {
             throw ASRError.processingFailed("Preprocessor failed to produce processed_signal output")
         }
 
         let melStartedAt = shouldProfile ? profileNow() : 0
+        let melInterval = beginProfileInterval("Nemotron.MelInput")
         let encoderMel = try buildSingleEncoderMelInput(from: processedSignal)
         let melLen = try MLMultiArray(shape: [1], dataType: .int32)
         melLen[0] = NSNumber(value: config.totalMelFrames)
@@ -298,8 +305,10 @@ extension NemotronStreamingAsrManager {
         if shouldProfile {
             componentProfile.melInputTime += profileNow() - melStartedAt
         }
+        endProfileInterval("Nemotron.MelInput", melInterval)
 
         let encoderStartedAt = shouldProfile ? profileNow() : 0
+        let encoderInterval = beginProfileInterval("Nemotron.Encoder")
         let encoderOutput: MLFeatureProvider
         if config.encoderStateful {
             guard #available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *) else {
@@ -315,6 +324,7 @@ extension NemotronStreamingAsrManager {
         if shouldProfile {
             componentProfile.encoderTime += profileNow() - encoderStartedAt
         }
+        endProfileInterval("Nemotron.Encoder", encoderInterval)
         if let newCacheChannel = encoderOutput.featureValue(for: "cache_last_channel_next")?.multiArrayValue {
             self.cacheChannel = newCacheChannel
         }
@@ -359,12 +369,15 @@ extension NemotronStreamingAsrManager {
         )
 
         let decodeStartedAt = shouldProfile ? profileNow() : 0
+        let decodeInterval = beginProfileInterval("Nemotron.DecodeLoop")
         for t in 0..<numEncoderFrames {
             let encoderStepCopyStartedAt = shouldProfile ? profileNow() : 0
+            let encoderStepCopyInterval = beginProfileInterval("Nemotron.EncoderStepCopy")
             try copyEncoderStep(from: encoded, timeIndex: t, into: encStep)
             if shouldProfile {
                 componentProfile.encoderStepCopyTime += profileNow() - encoderStepCopyStartedAt
             }
+            endProfileInterval("Nemotron.EncoderStepCopy", encoderStepCopyInterval)
 
             for _ in 0..<10 {
                 tokenInput[0] = NSNumber(value: currentToken)
@@ -372,10 +385,12 @@ extension NemotronStreamingAsrManager {
                 decoderInput.cIn = currentC
 
                 let decoderStartedAt = shouldProfile ? profileNow() : 0
+                let decoderInterval = beginProfileInterval("Nemotron.Decoder")
                 let decoderOutput = try await decoder.prediction(from: decoderInput)
                 if shouldProfile {
                     componentProfile.decoderTime += profileNow() - decoderStartedAt
                 }
+                endProfileInterval("Nemotron.Decoder", decoderInterval)
                 guard let decoderOut = decoderOutput.featureValue(for: "decoder")?.multiArrayValue,
                     let hOut = decoderOutput.featureValue(for: "h_out")?.multiArrayValue,
                     let cOut = decoderOutput.featureValue(for: "c_out")?.multiArrayValue
@@ -388,10 +403,12 @@ extension NemotronStreamingAsrManager {
                 let predToken: Int
                 if let jointDecision {
                     let jointStartedAt = shouldProfile ? profileNow() : 0
+                    let jointDecisionInterval = beginProfileInterval("Nemotron.JointDecision")
                     let decisionOutput = try await jointDecision.prediction(from: jointInput)
                     if shouldProfile {
                         componentProfile.jointDecisionTime += profileNow() - jointStartedAt
                     }
+                    endProfileInterval("Nemotron.JointDecision", jointDecisionInterval)
                     guard let tokenId = decisionOutput.featureValue(for: "token_id")?.multiArrayValue else {
                         throw ASRError.processingFailed("Joint decision failed")
                     }
@@ -401,10 +418,12 @@ extension NemotronStreamingAsrManager {
                         throw ASRError.processingFailed("Missing joint model")
                     }
                     let jointStartedAt = shouldProfile ? profileNow() : 0
+                    let jointInterval = beginProfileInterval("Nemotron.Joint")
                     let jointOutput = try await joint.prediction(from: jointInput)
                     if shouldProfile {
                         componentProfile.jointTime += profileNow() - jointStartedAt
                     }
+                    endProfileInterval("Nemotron.Joint", jointInterval)
                     guard let logits = jointOutput.featureValue(for: "logits")?.multiArrayValue else {
                         throw ASRError.processingFailed("Joint failed")
                     }
@@ -428,6 +447,7 @@ extension NemotronStreamingAsrManager {
         if shouldProfile {
             componentProfile.decodeLoopTime += profileNow() - decodeStartedAt
         }
+        endProfileInterval("Nemotron.DecodeLoop", decodeInterval)
 
         self.lastToken = currentToken
         self.hState = currentH
