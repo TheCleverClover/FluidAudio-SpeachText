@@ -82,7 +82,7 @@ extension NemotronStreamingAsrManager {
 
     /// Process a single audio chunk through the full pipeline
     internal func processChunk(_ samples: [Float]) async throws {
-        if config.modelLayout == .singleEncoder {
+        if config.modelLayout == .singleEncoder || config.modelLayout == .splitEncoder {
             try await processSingleEncoderChunk(samples)
             return
         }
@@ -230,8 +230,21 @@ extension NemotronStreamingAsrManager {
     }
 
     private func processSingleEncoderChunk(_ samples: [Float]) async throws {
+        let isFirstChunk = processedChunks == 0
+        let activeEncoder: MLModel
+        if config.modelLayout == .splitEncoder {
+            guard let encoderInit, let encoderStep else {
+                throw ASRError.notInitialized
+            }
+            activeEncoder = isFirstChunk ? encoderInit : encoderStep
+        } else {
+            guard let encoder else {
+                throw ASRError.notInitialized
+            }
+            activeEncoder = encoder
+        }
+
         guard let preprocessor = preprocessor,
-            let encoder = encoder,
             let decoder = decoder,
             let cacheTime = cacheTime,
             let cacheLen = cacheLen,
@@ -282,9 +295,16 @@ extension NemotronStreamingAsrManager {
 
         let melStartedAt = shouldProfile ? profileNow() : 0
         let melInterval = beginProfileInterval("Nemotron.MelInput")
-        let encoderMel = try buildSingleEncoderMelInput(from: processedSignal)
+        let encoderMelFrames = isFirstChunk ? config.initTotalMelFrames : config.stepTotalMelFrames
+        let activePreEncodeCache = isFirstChunk ? config.initPreEncodeCache : config.preEncodeCache
+        let encoderMel = try buildSingleEncoderMelInput(
+            from: processedSignal,
+            totalMelFrames: encoderMelFrames,
+            preEncodeCache: activePreEncodeCache
+        )
         let melLen = try MLMultiArray(shape: [1], dataType: .int32)
-        melLen[0] = NSNumber(value: config.totalMelFrames)
+        let validMelFrames = min(processedSignal.shape[2].intValue, encoderMelFrames)
+        melLen[0] = NSNumber(value: validMelFrames)
 
         var encoderFeatures: [String: MLFeatureValue] = [
             "processed_signal": MLFeatureValue(multiArray: encoderMel),
@@ -317,9 +337,9 @@ extension NemotronStreamingAsrManager {
             guard let encoderState = encoderState as? MLState else {
                 throw ASRError.notInitialized
             }
-            encoderOutput = try await encoder.prediction(from: encoderInput, using: encoderState)
+            encoderOutput = try await activeEncoder.prediction(from: encoderInput, using: encoderState)
         } else {
-            encoderOutput = try await encoder.prediction(from: encoderInput)
+            encoderOutput = try await activeEncoder.prediction(from: encoderInput)
         }
         if shouldProfile {
             componentProfile.encoderTime += profileNow() - encoderStartedAt
@@ -339,9 +359,139 @@ extension NemotronStreamingAsrManager {
             throw ASRError.processingFailed("Encoder failed to produce encoded output")
         }
 
-        melCache = try extractMelCache(from: encoderMel)
-        let numEncoderFrames = encoded.shape[2].intValue
-        var newTokens: [Int] = []
+        melCache = try extractMelCache(from: processedSignal)
+        let numEncoderFrames = validEncoderFrameCount(from: encoderOutput, encoded: encoded)
+        try await runGreedyRnntDecodeLoop(
+            encoded: encoded,
+            numEncoderFrames: numEncoderFrames,
+            currentToken: &currentToken,
+            currentH: &currentH,
+            currentC: &currentC,
+            shouldProfile: shouldProfile
+        )
+
+        self.lastToken = currentToken
+        self.hState = currentH
+        self.cState = currentC
+
+        if let callback = partialCallback, let tokenizer = tokenizer, !accumulatedTokenIds.isEmpty {
+            callback(tokenizer.decode(ids: accumulatedTokenIds, skipSpecialTokens: true))
+        }
+
+        processedChunks += 1
+        if shouldProfile {
+            componentProfile.chunks += 1
+            componentProfile.totalChunkTime += profileNow() - chunkStartedAt
+        }
+    }
+
+    internal func processSplitEncoderMelChunk(_ melChunk: NemotronCacheAwareMelChunk) async throws {
+        let activeEncoder: MLModel
+        if melChunk.isFirstChunk {
+            guard let encoderInit else {
+                throw ASRError.notInitialized
+            }
+            activeEncoder = encoderInit
+        } else {
+            guard let encoderStep else {
+                throw ASRError.notInitialized
+            }
+            activeEncoder = encoderStep
+        }
+
+        guard let decoder = decoder,
+            let cacheTime = cacheTime,
+            let cacheLen = cacheLen,
+            let cacheChannel = cacheChannel,
+            var currentH = hState,
+            var currentC = cState
+        else {
+            throw ASRError.notInitialized
+        }
+        guard joint != nil || jointDecision != nil else {
+            throw ASRError.notInitialized
+        }
+
+        let shouldProfile = componentProfilingEnabled
+        let chunkStartedAt = shouldProfile ? profileNow() : 0
+        var currentToken = lastToken
+
+        let melLen = try MLMultiArray(shape: [1], dataType: .int32)
+        melLen[0] = NSNumber(value: melChunk.validMelFrames)
+
+        var encoderFeatures: [String: MLFeatureValue] = [
+            "processed_signal": MLFeatureValue(multiArray: melChunk.processedSignal),
+            "processed_signal_length": MLFeatureValue(multiArray: melLen),
+            "cache_last_time": MLFeatureValue(multiArray: cacheTime),
+            "cache_last_channel_len": MLFeatureValue(multiArray: cacheLen),
+            "cache_last_channel": MLFeatureValue(multiArray: cacheChannel),
+        ]
+        if config.runtimePrompt {
+            encoderFeatures["prompt_vector"] = MLFeatureValue(multiArray: try createPromptVector())
+        }
+
+        let encoderInput = try MLDictionaryFeatureProvider(dictionary: encoderFeatures)
+        let encoderOutput = try await activeEncoder.prediction(from: encoderInput)
+
+        if let newCacheChannel = encoderOutput.featureValue(for: "cache_last_channel_next")?.multiArrayValue {
+            self.cacheChannel = newCacheChannel
+        }
+        if let newCacheTime = encoderOutput.featureValue(for: "cache_last_time_next")?.multiArrayValue {
+            self.cacheTime = newCacheTime
+        }
+        if let newCacheLen = encoderOutput.featureValue(for: "cache_last_channel_next_len")?.multiArrayValue {
+            self.cacheLen = newCacheLen
+        }
+
+        guard let encoded = encoderOutput.featureValue(for: "encoded")?.multiArrayValue else {
+            throw ASRError.processingFailed("Encoder failed to produce encoded output")
+        }
+
+        let numEncoderFrames = validEncoderFrameCount(from: encoderOutput, encoded: encoded)
+        try await runGreedyRnntDecodeLoop(
+            encoded: encoded,
+            numEncoderFrames: numEncoderFrames,
+            currentToken: &currentToken,
+            currentH: &currentH,
+            currentC: &currentC,
+            shouldProfile: shouldProfile
+        )
+
+        self.lastToken = currentToken
+        self.hState = currentH
+        self.cState = currentC
+
+        if let callback = partialCallback, let tokenizer = tokenizer, !accumulatedTokenIds.isEmpty {
+            callback(tokenizer.decode(ids: accumulatedTokenIds, skipSpecialTokens: true))
+        }
+
+        processedChunks += 1
+        if shouldProfile {
+            componentProfile.chunks += 1
+            componentProfile.totalChunkTime += profileNow() - chunkStartedAt
+        }
+    }
+
+    internal func validEncoderFrameCount(from encoderOutput: MLFeatureProvider, encoded: MLMultiArray) -> Int {
+        var numEncoderFrames = encoded.shape[2].intValue
+        if let encodedLen = encoderOutput.featureValue(for: "encoded_len")?.multiArrayValue {
+            numEncoderFrames = min(numEncoderFrames, encodedLen[0].intValue)
+        }
+        return numEncoderFrames
+    }
+
+    internal func runGreedyRnntDecodeLoop(
+        encoded: MLMultiArray,
+        numEncoderFrames: Int,
+        currentToken: inout Int32,
+        currentH: inout MLMultiArray,
+        currentC: inout MLMultiArray,
+        shouldProfile: Bool
+    ) async throws {
+        guard let decoder, joint != nil || jointDecision != nil else {
+            throw ASRError.notInitialized
+        }
+
         let encStep = try MLMultiArray(
             shape: [1, NSNumber(value: encoded.shape[1].intValue), 1],
             dataType: .float32
@@ -437,7 +587,6 @@ extension NemotronStreamingAsrManager {
                     break
                 }
 
-                newTokens.append(predToken)
                 accumulatedTokenIds.append(predToken)
                 currentToken = Int32(predToken)
                 currentH = hOut
@@ -448,20 +597,6 @@ extension NemotronStreamingAsrManager {
             componentProfile.decodeLoopTime += profileNow() - decodeStartedAt
         }
         endProfileInterval("Nemotron.DecodeLoop", decodeInterval)
-
-        self.lastToken = currentToken
-        self.hState = currentH
-        self.cState = currentC
-
-        if !newTokens.isEmpty, let callback = partialCallback, let tokenizer = tokenizer {
-            callback(tokenizer.decode(ids: accumulatedTokenIds, skipSpecialTokens: true))
-        }
-
-        processedChunks += 1
-        if shouldProfile {
-            componentProfile.chunks += 1
-            componentProfile.totalChunkTime += profileNow() - chunkStartedAt
-        }
     }
 
     // MARK: - Tensor Utilities
@@ -505,9 +640,15 @@ extension NemotronStreamingAsrManager {
         return array
     }
 
-    internal func buildSingleEncoderMelInput(from processedSignal: MLMultiArray) throws -> MLMultiArray {
+    internal func buildSingleEncoderMelInput(
+        from processedSignal: MLMultiArray,
+        totalMelFrames: Int? = nil,
+        preEncodeCache: Int? = nil
+    ) throws -> MLMultiArray {
+        let totalFrames = totalMelFrames ?? config.totalMelFrames
+        let cacheFramesBudget = preEncodeCache ?? config.preEncodeCache
         let result = try MLMultiArray(
-            shape: [1, NSNumber(value: config.melFeatures), NSNumber(value: config.totalMelFrames)],
+            shape: [1, NSNumber(value: config.melFeatures), NSNumber(value: totalFrames)],
             dataType: .float32
         )
         result.reset(to: 0)
@@ -518,7 +659,7 @@ extension NemotronStreamingAsrManager {
         let resultStride2 = result.strides[2].intValue
 
         if let melCache = melCache {
-            let cacheFrames = min(melCache.shape[2].intValue, config.preEncodeCache)
+            let cacheFrames = min(melCache.shape[2].intValue, cacheFramesBudget)
             let cachePtr = melCache.dataPointer.bindMemory(to: Float.self, capacity: melCache.count)
             let cacheStride0 = melCache.strides[0].intValue
             let cacheStride1 = melCache.strides[1].intValue
@@ -534,7 +675,7 @@ extension NemotronStreamingAsrManager {
         }
 
         let signalFrames = processedSignal.shape[2].intValue
-        let copyFrames = min(config.chunkMelFrames, signalFrames, config.totalMelFrames - config.preEncodeCache)
+        let copyFrames = min(config.chunkMelFrames, signalFrames, totalFrames - cacheFramesBudget)
         let signalPtr = processedSignal.dataPointer.bindMemory(to: Float.self, capacity: processedSignal.count)
         let signalStride0 = processedSignal.strides[0].intValue
         let signalStride1 = processedSignal.strides[1].intValue
@@ -543,7 +684,7 @@ extension NemotronStreamingAsrManager {
         for mel in 0..<config.melFeatures {
             for t in 0..<copyFrames {
                 let srcIdx = 0 * signalStride0 + mel * signalStride1 + t * signalStride2
-                let dstIdx = 0 * resultStride0 + mel * resultStride1 + (config.preEncodeCache + t) * resultStride2
+                let dstIdx = 0 * resultStride0 + mel * resultStride1 + (cacheFramesBudget + t) * resultStride2
                 resultPtr[dstIdx] = signalPtr[srcIdx]
             }
         }

@@ -32,6 +32,8 @@ public actor NemotronStreamingAsrManager {
     // Models
     internal var preprocessor: MLModel?
     internal var encoder: MLModel?
+    internal var encoderInit: MLModel?
+    internal var encoderStep: MLModel?
     internal var decoder: MLModel?
     internal var joint: MLModel?
     internal var jointDecision: MLModel?
@@ -160,13 +162,33 @@ public actor NemotronStreamingAsrManager {
         )
         self.preprocessor = try await loadCoreMLModel(at: preprocessorPath)
 
-        let encoderPath: URL
-        if config.modelLayout == .singleEncoder {
-            encoderPath = try resolveModelURL(in: modelDir, candidates: ["encoder.mlmodelc", "encoder.mlpackage"])
-        } else {
-            encoderPath = modelDir.appendingPathComponent("encoder").appendingPathComponent(NemotronEncoder.fileName)
+        self.encoderInit = nil
+        self.encoderStep = nil
+        switch config.modelLayout {
+        case .singleEncoder, .offlineEncoder:
+            let encoderPath = try resolveModelURL(
+                in: modelDir,
+                candidates: ["encoder.mlmodelc", "encoder.mlpackage"]
+            )
+            self.encoder = try await loadCoreMLModel(at: encoderPath)
+        case .splitEncoder:
+            let encoderInitPath = try resolveModelURL(
+                in: modelDir,
+                candidates: ["encoder_init.mlmodelc", "encoder_init.mlpackage"]
+            )
+            let encoderStepPath = try resolveModelURL(
+                in: modelDir,
+                candidates: ["encoder_step.mlmodelc", "encoder_step.mlpackage"]
+            )
+            self.encoderInit = try await loadCoreMLModel(at: encoderInitPath)
+            self.encoderStep = try await loadCoreMLModel(at: encoderStepPath)
+            self.encoder = self.encoderInit
+        case .legacy:
+            let encoderPath = modelDir
+                .appendingPathComponent("encoder")
+                .appendingPathComponent(NemotronEncoder.fileName)
+            self.encoder = try await loadCoreMLModel(at: encoderPath)
         }
-        self.encoder = try await loadCoreMLModel(at: encoderPath)
 
         // Load decoder
         let decoderPath = try resolveModelURL(
@@ -407,12 +429,14 @@ public actor NemotronStreamingAsrManager {
     /// Process audio and return partial transcript
     public func process(audioBuffer: AVAudioPCMBuffer) async throws -> String {
         // Check if models are loaded
-        guard preprocessor != nil, encoder != nil, decoder != nil, (joint != nil || jointDecision != nil) else {
-            throw ASRError.notInitialized
-        }
+        try ensureModelsLoaded()
 
         let samples = try audioConverter.resampleBuffer(audioBuffer)
         self.audioBuffer.append(contentsOf: samples)
+
+        if config.modelLayout == .splitEncoder {
+            return ""
+        }
 
         // Process complete chunks
         while self.audioBuffer.count >= config.chunkSamples {
@@ -430,14 +454,10 @@ public actor NemotronStreamingAsrManager {
     /// the incremental audio queue. This keeps benchmark runs from spending time shifting
     /// large Swift arrays while preserving the model/cache contract used for streaming.
     public func transcribe(audioBuffer: AVAudioPCMBuffer) async throws -> String {
-        guard let tokenizer = tokenizer,
-            preprocessor != nil,
-            encoder != nil,
-            decoder != nil,
-            (joint != nil || jointDecision != nil)
-        else {
+        guard let tokenizer = tokenizer else {
             throw ASRError.notInitialized
         }
+        try ensureModelsLoaded()
 
         self.audioBuffer.removeAll()
         self.accumulatedTokenIds.removeAll()
@@ -449,20 +469,26 @@ public actor NemotronStreamingAsrManager {
             return ""
         }
 
-        var offset = 0
-        while offset < samples.count {
-            let end = min(offset + config.chunkSamples, samples.count)
-            var chunk = Array(samples[offset..<end])
-            if chunk.count < config.chunkSamples {
-                chunk.append(contentsOf: repeatElement(0.0, count: config.chunkSamples - chunk.count))
+        if config.modelLayout == .offlineEncoder {
+            try await transcribeOffline(samples: samples)
+        } else if config.modelLayout == .splitEncoder {
+            try await transcribeSplitEncoder(samples: samples)
+        } else {
+            var offset = 0
+            while offset < samples.count {
+                let end = min(offset + config.chunkSamples, samples.count)
+                var chunk = Array(samples[offset..<end])
+                if chunk.count < config.chunkSamples {
+                    chunk.append(contentsOf: repeatElement(0.0, count: config.chunkSamples - chunk.count))
+                }
+                try await processChunk(chunk)
+                offset += config.shiftSamples
             }
-            try await processChunk(chunk)
-            offset += config.shiftSamples
         }
 
         let transcript = tokenizer.decode(
             ids: accumulatedTokenIds,
-            skipSpecialTokens: config.modelLayout == .singleEncoder
+            skipSpecialTokens: config.modelLayout != .legacy
         )
         accumulatedTokenIds.removeAll()
         return transcript
@@ -471,35 +497,160 @@ public actor NemotronStreamingAsrManager {
     /// Finish processing and return final transcript
     public func finish() async throws -> String {
         // Check if models are loaded
-        guard let tokenizer = tokenizer,
-            preprocessor != nil,
-            encoder != nil,
-            decoder != nil,
-            (joint != nil || jointDecision != nil)
-        else {
+        guard let tokenizer = tokenizer else {
             throw ASRError.notInitialized
         }
+        try ensureModelsLoaded()
 
-        // Process remaining audio (padded if needed)
         if !audioBuffer.isEmpty {
-            let paddingNeeded = config.chunkSamples - audioBuffer.count
-            if paddingNeeded > 0 {
-                audioBuffer.append(contentsOf: Array(repeating: 0.0, count: paddingNeeded))
-            }
+            if config.modelLayout == .splitEncoder {
+                accumulatedTokenIds.removeAll()
+                processedChunks = 0
+                try resetStates()
+                try await transcribeSplitEncoder(samples: audioBuffer)
+            } else {
+                let paddingNeeded = config.chunkSamples - audioBuffer.count
+                if paddingNeeded > 0 {
+                    audioBuffer.append(contentsOf: Array(repeating: 0.0, count: paddingNeeded))
+                }
 
-            let chunk = Array(audioBuffer.prefix(config.chunkSamples))
-            try await processChunk(chunk)
+                let chunk = Array(audioBuffer.prefix(config.chunkSamples))
+                try await processChunk(chunk)
+            }
             audioBuffer.removeAll()
         }
 
         // Decode accumulated tokens
         let transcript = tokenizer.decode(
             ids: accumulatedTokenIds,
-            skipSpecialTokens: config.modelLayout == .singleEncoder
+            skipSpecialTokens: config.modelLayout != .legacy
         )
         accumulatedTokenIds.removeAll()
 
         return transcript
+    }
+
+    /// Offline full-context encoder: whole utterance in one encoder pass (no cache).
+    internal func transcribeOffline(samples: [Float]) async throws {
+        guard let preprocessor, let encoder else {
+            throw ASRError.notInitialized
+        }
+        guard var currentH = hState, var currentC = cState else {
+            throw ASRError.notInitialized
+        }
+
+        let audioArray = try createAudioArray(samples)
+        let audioLen = try MLMultiArray(shape: [1], dataType: .int32)
+        audioLen[0] = NSNumber(value: samples.count)
+        let preprocInput = try MLDictionaryFeatureProvider(dictionary: [
+            "audio_signal": MLFeatureValue(multiArray: audioArray),
+            "audio_length": MLFeatureValue(multiArray: audioLen),
+        ])
+        let preprocOutput = try await preprocessor.prediction(from: preprocInput)
+        guard let processedSignal = preprocOutput.featureValue(for: "processed_signal")?.multiArrayValue else {
+            throw ASRError.processingFailed("Preprocessor failed to produce processed_signal output")
+        }
+        let validFrames: Int
+        if let lengthArray = preprocOutput.featureValue(for: "processed_signal_length")?.multiArrayValue {
+            validFrames = max(0, lengthArray[0].intValue)
+        } else {
+            validFrames = processedSignal.shape[2].intValue
+        }
+
+        let melWidth = config.maxMelFrames > 0 ? config.maxMelFrames : processedSignal.shape[2].intValue
+        let copyFrames = min(validFrames, melWidth)
+        let encoderMel = try sliceFullMel(from: processedSignal, copyFrames: copyFrames, targetWidth: melWidth)
+        let melLen = try MLMultiArray(shape: [1], dataType: .int32)
+        melLen[0] = NSNumber(value: copyFrames)
+
+        var feats: [String: MLFeatureValue] = [
+            "processed_signal": MLFeatureValue(multiArray: encoderMel),
+            "processed_signal_length": MLFeatureValue(multiArray: melLen),
+        ]
+        if config.runtimePrompt {
+            feats["prompt_vector"] = MLFeatureValue(multiArray: try createPromptVector())
+        }
+        let encoderOutput = try await encoder.prediction(from: try MLDictionaryFeatureProvider(dictionary: feats))
+        guard let encoded = encoderOutput.featureValue(for: "encoded")?.multiArrayValue else {
+            throw ASRError.processingFailed("Offline encoder failed to produce encoded output")
+        }
+        let numEncoderFrames = validEncoderFrameCount(from: encoderOutput, encoded: encoded)
+        var currentToken = lastToken
+        try await runGreedyRnntDecodeLoop(
+            encoded: encoded,
+            numEncoderFrames: numEncoderFrames,
+            currentToken: &currentToken,
+            currentH: &currentH,
+            currentC: &currentC,
+            shouldProfile: false
+        )
+        self.lastToken = currentToken
+        self.hState = currentH
+        self.cState = currentC
+        processedChunks += 1
+    }
+
+    private func sliceFullMel(from source: MLMultiArray, copyFrames: Int, targetWidth: Int) throws -> MLMultiArray {
+        let melFeatures = config.melFeatures
+        let result = try MLMultiArray(
+            shape: [1, NSNumber(value: melFeatures), NSNumber(value: targetWidth)],
+            dataType: .float32
+        )
+        result.reset(to: 0)
+        guard copyFrames > 0 else { return result }
+        let srcPtr = source.dataPointer.bindMemory(to: Float.self, capacity: source.count)
+        let dstPtr = result.dataPointer.bindMemory(to: Float.self, capacity: result.count)
+        let s0 = source.strides[0].intValue, s1 = source.strides[1].intValue, s2 = source.strides[2].intValue
+        let d0 = result.strides[0].intValue, d1 = result.strides[1].intValue, d2 = result.strides[2].intValue
+        for mel in 0..<melFeatures {
+            for t in 0..<copyFrames {
+                dstPtr[0 * d0 + mel * d1 + t * d2] = srcPtr[0 * s0 + mel * s1 + t * s2]
+            }
+        }
+        return result
+    }
+
+    /// NeMo cache-aware mel chunking for split `encoder_init` / `encoder_step` bundles.
+    internal func transcribeSplitEncoder(samples: [Float]) async throws {
+        guard let preprocessor else {
+            throw ASRError.notInitialized
+        }
+
+        let audioArray = try createAudioArray(samples)
+        let audioLen = try MLMultiArray(shape: [1], dataType: .int32)
+        audioLen[0] = NSNumber(value: samples.count)
+
+        let preprocInput = try MLDictionaryFeatureProvider(dictionary: [
+            "audio_signal": MLFeatureValue(multiArray: audioArray),
+            "audio_length": MLFeatureValue(multiArray: audioLen),
+        ])
+        let preprocOutput = try await preprocessor.prediction(from: preprocInput)
+        guard let processedSignal = preprocOutput.featureValue(for: "processed_signal")?.multiArrayValue else {
+            throw ASRError.processingFailed("Preprocessor failed to produce processed_signal output")
+        }
+
+        let validFrames: Int
+        if let lengthArray = preprocOutput.featureValue(for: "processed_signal_length")?.multiArrayValue {
+            validFrames = max(0, lengthArray[0].intValue)
+        } else {
+            validFrames = processedSignal.shape[2].intValue
+        }
+
+        let melChunks = try NemotronCacheAwareMelChunker.makeChunks(
+            from: processedSignal,
+            validFrames: validFrames,
+            config: config
+        )
+        for melChunk in melChunks {
+            try await processSplitEncoderMelChunk(melChunk)
+        }
+    }
+
+    private func ensureModelsLoaded() throws {
+        let hasEncoder = encoder != nil || (encoderInit != nil && encoderStep != nil)
+        guard preprocessor != nil, hasEncoder, decoder != nil, (joint != nil || jointDecision != nil) else {
+            throw ASRError.notInitialized
+        }
     }
 
     /// Get current partial transcript without finishing
@@ -507,7 +658,7 @@ public actor NemotronStreamingAsrManager {
         guard let tokenizer = tokenizer else { return "" }
         return tokenizer.decode(
             ids: accumulatedTokenIds,
-            skipSpecialTokens: config.modelLayout == .singleEncoder
+            skipSpecialTokens: config.modelLayout != .legacy
         )
     }
 }

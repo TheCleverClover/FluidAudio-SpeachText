@@ -176,8 +176,7 @@ public class NemotronTranscribe {
 
                     // Transcribe
                     let startTime = Date()
-                    _ = try await manager.process(audioBuffer: buffer)
-                    let transcript = try await manager.finish()
+                    let transcript = try await manager.transcribe(audioBuffer: buffer)
                     let processingTime = Date().timeIntervalSince(startTime)
 
                     let rtf = audioDuration > 0 ? processingTime / audioDuration : 0.0
