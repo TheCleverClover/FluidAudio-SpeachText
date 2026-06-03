@@ -480,13 +480,20 @@ extension NemotronStreamingAsrManager {
         return numEncoderFrames
     }
 
+    /// Greedy RNNT decode over `numEncoderFrames` encoder steps.
+    ///
+    /// When `tokenSink` is nil (streaming/default), emitted token ids are appended to the
+    /// shared `accumulatedTokenIds`, preserving existing behavior. When `tokenSink` is set
+    /// (offline sliding-window path), emitted tokens are reported as `(tokenId, frameIndex)`
+    /// and NOT appended to `accumulatedTokenIds`, so the caller can merge windows itself.
     internal func runGreedyRnntDecodeLoop(
         encoded: MLMultiArray,
         numEncoderFrames: Int,
         currentToken: inout Int32,
         currentH: inout MLMultiArray,
         currentC: inout MLMultiArray,
-        shouldProfile: Bool
+        shouldProfile: Bool,
+        tokenSink: ((Int, Int) -> Void)? = nil
     ) async throws {
         guard let decoder, joint != nil || jointDecision != nil else {
             throw ASRError.notInitialized
@@ -587,7 +594,11 @@ extension NemotronStreamingAsrManager {
                     break
                 }
 
-                accumulatedTokenIds.append(predToken)
+                if let tokenSink {
+                    tokenSink(predToken, t)
+                } else {
+                    accumulatedTokenIds.append(predToken)
+                }
                 currentToken = Int32(predToken)
                 currentH = hOut
                 currentC = cOut

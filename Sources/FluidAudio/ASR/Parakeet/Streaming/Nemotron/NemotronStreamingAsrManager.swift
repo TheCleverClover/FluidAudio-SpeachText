@@ -184,7 +184,8 @@ public actor NemotronStreamingAsrManager {
             self.encoderStep = try await loadCoreMLModel(at: encoderStepPath)
             self.encoder = self.encoderInit
         case .legacy:
-            let encoderPath = modelDir
+            let encoderPath =
+                modelDir
                 .appendingPathComponent("encoder")
                 .appendingPathComponent(NemotronEncoder.fileName)
             self.encoder = try await loadCoreMLModel(at: encoderPath)
@@ -221,7 +222,8 @@ public actor NemotronStreamingAsrManager {
         // Initialize states
         try resetStates()
 
-        logger.info("Nemotron models loaded successfully (\(config.chunkMs)ms shift, \(config.chunkMelFrames * 10)ms window).")
+        logger.info(
+            "Nemotron models loaded successfully (\(config.chunkMs)ms shift, \(config.chunkMelFrames * 10)ms window).")
     }
 
     private func resolveModelURL(in modelDir: URL, candidates: [String]) throws -> URL {
@@ -264,7 +266,8 @@ public actor NemotronStreamingAsrManager {
         let attributes = try fileManager.attributesOfItem(atPath: packageURL.path)
         let modifiedAt = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
         let baseName = packageURL.deletingPathExtension().lastPathComponent
-        let compiledName = "\(baseName)_\(computeUnitsKey(mlConfiguration.computeUnits))_\(Int64(modifiedAt * 1000)).mlmodelc"
+        let compiledName =
+            "\(baseName)_\(computeUnitsKey(mlConfiguration.computeUnits))_\(Int64(modifiedAt * 1000)).mlmodelc"
         let compiledURL = cacheRoot.appendingPathComponent(compiledName, isDirectory: true)
         if fileManager.fileExists(atPath: compiledURL.path) {
             return compiledURL
@@ -290,7 +293,8 @@ public actor NemotronStreamingAsrManager {
         }
 
         let tempCompiledURL = try MLModel.compileModel(at: packageURL)
-        let stagedURL = cacheRoot.appendingPathComponent("\(compiledName).staging.\(UUID().uuidString)", isDirectory: true)
+        let stagedURL = cacheRoot.appendingPathComponent(
+            "\(compiledName).staging.\(UUID().uuidString)", isDirectory: true)
         try? fileManager.removeItem(at: stagedURL)
         try fileManager.copyItem(at: tempCompiledURL, to: stagedURL)
 
@@ -306,9 +310,11 @@ public actor NemotronStreamingAsrManager {
     }
 
     private func compiledArtifactsDirectory(for packageURL: URL) -> URL {
-        let cachesDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+        let cachesDirectory =
+            FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? packageURL.deletingLastPathComponent()
-        return cachesDirectory
+        return
+            cachesDirectory
             .appendingPathComponent("FluidAudio", isDirectory: true)
             .appendingPathComponent("CompiledNemotronModels", isDirectory: true)
             .appendingPathComponent(stableCompiledDirectoryName(for: packageURL), isDirectory: true)
@@ -530,12 +536,72 @@ public actor NemotronStreamingAsrManager {
         return transcript
     }
 
-    /// Offline full-context encoder: whole utterance in one encoder pass (no cache).
+    /// Offline full-context encoder.
+    ///
+    /// The offline encoder is converted to a fixed CoreML window (`config.maxMelFrames`), so a
+    /// single pass can only cover ~one window of audio (and a single pass over very long audio
+    /// would exhaust memory). For longer audio we slide that window with overlap and merge the
+    /// per-window token streams with `AsrChunkTokenMerger` — the same overlap-merge the Parakeet
+    /// `ChunkProcessor` uses. The public `transcribe`/`finish` API is unchanged.
     internal func transcribeOffline(samples: [Float]) async throws {
-        guard let preprocessor, let encoder else {
+        guard preprocessor != nil, encoder != nil else {
             throw ASRError.notInitialized
         }
-        guard var currentH = hState, var currentC = cState else {
+
+        let sampleRate = 16000
+        let frameSamples = ASRConstants.samplesPerEncoderFrame
+        let melCap =
+            config.maxMelFrames > 0
+            ? config.maxMelFrames
+            : (ASRConstants.maxModelSamples / ASRConstants.melHopSize)
+        let maxWindowSamples = melCap * ASRConstants.melHopSize
+        // Frame-aligned window, leaving one hop of slack so a full window's mel stays within the
+        // fixed encoder width.
+        let rawWindow = max(maxWindowSamples - ASRConstants.melHopSize, frameSamples)
+        let windowSamples = (rawWindow / frameSamples) * frameSamples
+        let overlapRequested = Int(2.0 * Double(sampleRate))
+        let overlapCapped = min(overlapRequested, windowSamples / 2)
+        let overlapSamples = (overlapCapped / frameSamples) * frameSamples
+        let strideSamples = max(windowSamples - overlapSamples, frameSamples)
+
+        // Whole utterance fits one encoder window → single pass (prior behavior).
+        if samples.count <= windowSamples {
+            try await decodeOfflineWindow(samples: samples, tokenSink: nil)
+            processedChunks += 1
+            return
+        }
+
+        // Long audio → sliding window. Each window is an independent full-context pass with a
+        // fresh RNNT decoder state; overlaps are reconciled by the shared token merger.
+        var chunkOutputs: [[AsrChunkTokenMerger.TokenWindow]] = []
+        var start = 0
+        while start < samples.count {
+            try Task.checkCancellation()
+            let end = min(start + windowSamples, samples.count)
+            let windowAudio = Array(samples[start..<end])
+            let startFrame = start / frameSamples
+            var windowTokens: [AsrChunkTokenMerger.TokenWindow] = []
+            try await decodeOfflineWindow(samples: windowAudio) { tokenId, frame in
+                windowTokens.append((token: tokenId, timestamp: startFrame + frame, confidence: 1.0, duration: 0))
+            }
+            chunkOutputs.append(windowTokens)
+            if end >= samples.count { break }
+            start += strideSamples
+        }
+
+        let merged = AsrChunkTokenMerger.merge(chunkOutputs, sampleRate: sampleRate, overlapSeconds: 2.0)
+        accumulatedTokenIds = merged.map { $0.token }
+        processedChunks += chunkOutputs.count
+    }
+
+    /// Run the offline encoder + RNNT greedy decode over a single window of audio.
+    /// `tokenSink` nil → emitted tokens append to `accumulatedTokenIds` (single-pass path).
+    /// `tokenSink` set → emitted `(tokenId, encoderFrame)` are reported for window merging.
+    private func decodeOfflineWindow(
+        samples: [Float],
+        tokenSink: ((Int, Int) -> Void)?
+    ) async throws {
+        guard let preprocessor, let encoder else {
             throw ASRError.notInitialized
         }
 
@@ -575,19 +641,28 @@ public actor NemotronStreamingAsrManager {
             throw ASRError.processingFailed("Offline encoder failed to produce encoded output")
         }
         let numEncoderFrames = validEncoderFrameCount(from: encoderOutput, encoded: encoded)
-        var currentToken = lastToken
+
+        var currentToken = Int32(config.blankIdx)
+        var currentH = try makeZeroDecoderState()
+        var currentC = try makeZeroDecoderState()
         try await runGreedyRnntDecodeLoop(
             encoded: encoded,
             numEncoderFrames: numEncoderFrames,
             currentToken: &currentToken,
             currentH: &currentH,
             currentC: &currentC,
-            shouldProfile: false
+            shouldProfile: false,
+            tokenSink: tokenSink
         )
-        self.lastToken = currentToken
-        self.hState = currentH
-        self.cState = currentC
-        processedChunks += 1
+    }
+
+    private func makeZeroDecoderState() throws -> MLMultiArray {
+        let array = try MLMultiArray(
+            shape: [NSNumber(value: config.decoderLayers), 1, NSNumber(value: config.decoderHidden)],
+            dataType: .float32
+        )
+        array.reset(to: 0)
+        return array
     }
 
     private func sliceFullMel(from source: MLMultiArray, copyFrames: Int, targetWidth: Int) throws -> MLMultiArray {
@@ -600,8 +675,12 @@ public actor NemotronStreamingAsrManager {
         guard copyFrames > 0 else { return result }
         let srcPtr = source.dataPointer.bindMemory(to: Float.self, capacity: source.count)
         let dstPtr = result.dataPointer.bindMemory(to: Float.self, capacity: result.count)
-        let s0 = source.strides[0].intValue, s1 = source.strides[1].intValue, s2 = source.strides[2].intValue
-        let d0 = result.strides[0].intValue, d1 = result.strides[1].intValue, d2 = result.strides[2].intValue
+        let s0 = source.strides[0].intValue
+        let s1 = source.strides[1].intValue
+        let s2 = source.strides[2].intValue
+        let d0 = result.strides[0].intValue
+        let d1 = result.strides[1].intValue
+        let d2 = result.strides[2].intValue
         for mel in 0..<melFeatures {
             for t in 0..<copyFrames {
                 dstPtr[0 * d0 + mel * d1 + t * d2] = srcPtr[0 * s0 + mel * s1 + t * s2]
@@ -648,7 +727,7 @@ public actor NemotronStreamingAsrManager {
 
     private func ensureModelsLoaded() throws {
         let hasEncoder = encoder != nil || (encoderInit != nil && encoderStep != nil)
-        guard preprocessor != nil, hasEncoder, decoder != nil, (joint != nil || jointDecision != nil) else {
+        guard preprocessor != nil, hasEncoder, decoder != nil, joint != nil || jointDecision != nil else {
             throw ASRError.notInitialized
         }
     }
@@ -691,7 +770,7 @@ extension NemotronStreamingAsrManager: StreamingAsrEngine {
     }
 
     public func processBufferedAudio() async throws {
-        guard preprocessor != nil, encoder != nil, decoder != nil, (joint != nil || jointDecision != nil) else {
+        guard preprocessor != nil, encoder != nil, decoder != nil, joint != nil || jointDecision != nil else {
             throw ASRError.notInitialized
         }
 
