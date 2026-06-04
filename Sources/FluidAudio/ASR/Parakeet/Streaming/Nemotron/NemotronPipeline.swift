@@ -486,6 +486,38 @@ extension NemotronStreamingAsrManager {
     /// shared `accumulatedTokenIds`, preserving existing behavior. When `tokenSink` is set
     /// (offline sliding-window path), emitted tokens are reported as `(tokenId, frameIndex)`
     /// and NOT appended to `accumulatedTokenIds`, so the caller can merge windows itself.
+    /// Caches the prediction-network output for a given (token, h, c). In RNN-T the
+    /// decoder output only changes when a non-blank token is emitted; across blank-advanced
+    /// frames the inputs are unchanged, so we reuse the cached output instead of re-running.
+    private struct CachedDecoderOutput {
+        let token: Int32
+        let hIn: MLMultiArray
+        let cIn: MLMultiArray
+        let decoderOut: MLMultiArray
+        let hOut: MLMultiArray
+        let cOut: MLMultiArray
+
+        func matches(token: Int32, hIn: MLMultiArray, cIn: MLMultiArray) -> Bool {
+            self.token == token && self.hIn === hIn && self.cIn === cIn
+        }
+    }
+
+    /// Pre-allocates output buffers so CoreML reuses them across predict() calls instead of
+    /// allocating a fresh output array each step (cuts per-call output copy/alloc overhead).
+    private func makeOutputBackings(for model: MLModel) throws -> [String: Any] {
+        var backings: [String: Any] = [:]
+        for (name, description) in model.modelDescription.outputDescriptionsByName {
+            guard let constraint = description.multiArrayConstraint else {
+                continue
+            }
+            backings[name] = try MLMultiArray(
+                shape: constraint.shape,
+                dataType: constraint.dataType
+            )
+        }
+        return backings
+    }
+
     internal func runGreedyRnntDecodeLoop(
         encoded: MLMultiArray,
         numEncoderFrames: Int,
@@ -524,9 +556,18 @@ extension NemotronStreamingAsrManager {
             encoderName: "encoded",
             decoderName: "decoder"
         )
+        let jointDecisionOptions: MLPredictionOptions?
+        if let jointDecision {
+            let options = MLPredictionOptions()
+            options.outputBackings = try self.makeOutputBackings(for: jointDecision)
+            jointDecisionOptions = options
+        } else {
+            jointDecisionOptions = nil
+        }
 
         let decodeStartedAt = shouldProfile ? profileNow() : 0
         let decodeInterval = beginProfileInterval("Nemotron.DecodeLoop")
+        var cachedDecoderOutput: CachedDecoderOutput?
         for t in 0..<numEncoderFrames {
             let encoderStepCopyStartedAt = shouldProfile ? profileNow() : 0
             let encoderStepCopyInterval = beginProfileInterval("Nemotron.EncoderStepCopy")
@@ -537,22 +578,45 @@ extension NemotronStreamingAsrManager {
             endProfileInterval("Nemotron.EncoderStepCopy", encoderStepCopyInterval)
 
             for _ in 0..<10 {
-                tokenInput[0] = NSNumber(value: currentToken)
-                decoderInput.hIn = currentH
-                decoderInput.cIn = currentC
+                let decoderOut: MLMultiArray
+                let hOut: MLMultiArray
+                let cOut: MLMultiArray
 
-                let decoderStartedAt = shouldProfile ? profileNow() : 0
-                let decoderInterval = beginProfileInterval("Nemotron.Decoder")
-                let decoderOutput = try await decoder.prediction(from: decoderInput)
-                if shouldProfile {
-                    componentProfile.decoderTime += profileNow() - decoderStartedAt
-                }
-                endProfileInterval("Nemotron.Decoder", decoderInterval)
-                guard let decoderOut = decoderOutput.featureValue(for: "decoder")?.multiArrayValue,
-                    let hOut = decoderOutput.featureValue(for: "h_out")?.multiArrayValue,
-                    let cOut = decoderOutput.featureValue(for: "c_out")?.multiArrayValue
-                else {
-                    throw ASRError.processingFailed("Decoder failed")
+                if let cached = cachedDecoderOutput,
+                    cached.matches(token: currentToken, hIn: currentH, cIn: currentC)
+                {
+                    decoderOut = cached.decoderOut
+                    hOut = cached.hOut
+                    cOut = cached.cOut
+                } else {
+                    tokenInput[0] = NSNumber(value: currentToken)
+                    decoderInput.hIn = currentH
+                    decoderInput.cIn = currentC
+
+                    let decoderStartedAt = shouldProfile ? profileNow() : 0
+                    let decoderInterval = beginProfileInterval("Nemotron.Decoder")
+                    let decoderOutput = try await decoder.prediction(from: decoderInput)
+                    if shouldProfile {
+                        componentProfile.decoderTime += profileNow() - decoderStartedAt
+                    }
+                    endProfileInterval("Nemotron.Decoder", decoderInterval)
+                    guard let outputDecoderOut = decoderOutput.featureValue(for: "decoder")?.multiArrayValue,
+                        let outputHOut = decoderOutput.featureValue(for: "h_out")?.multiArrayValue,
+                        let outputCOut = decoderOutput.featureValue(for: "c_out")?.multiArrayValue
+                    else {
+                        throw ASRError.processingFailed("Decoder failed")
+                    }
+                    decoderOut = outputDecoderOut
+                    hOut = outputHOut
+                    cOut = outputCOut
+                    cachedDecoderOutput = CachedDecoderOutput(
+                        token: currentToken,
+                        hIn: currentH,
+                        cIn: currentC,
+                        decoderOut: decoderOut,
+                        hOut: hOut,
+                        cOut: cOut
+                    )
                 }
 
                 jointInput.decoderStep = decoderOut
@@ -561,7 +625,13 @@ extension NemotronStreamingAsrManager {
                 if let jointDecision {
                     let jointStartedAt = shouldProfile ? profileNow() : 0
                     let jointDecisionInterval = beginProfileInterval("Nemotron.JointDecision")
-                    let decisionOutput = try await jointDecision.prediction(from: jointInput)
+                    let decisionOutput: MLFeatureProvider
+                    if let jointDecisionOptions {
+                        decisionOutput = try await jointDecision.prediction(
+                            from: jointInput, options: jointDecisionOptions)
+                    } else {
+                        decisionOutput = try await jointDecision.prediction(from: jointInput)
+                    }
                     if shouldProfile {
                         componentProfile.jointDecisionTime += profileNow() - jointStartedAt
                     }
