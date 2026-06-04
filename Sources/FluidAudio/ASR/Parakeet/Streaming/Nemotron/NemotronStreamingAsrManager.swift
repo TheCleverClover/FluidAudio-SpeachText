@@ -153,6 +153,16 @@ public actor NemotronStreamingAsrManager {
             self.activeTargetLanguage = config.targetLang
             self.promptVectorCache = nil
             logger.info("Loaded config: \(config.chunkMs)ms chunks, \(config.chunkMelFrames) mel frames")
+
+            // Offline ("Accurate") encoder is GPU-optimal on Apple Silicon; ANE
+            // fragments it (CoreML places ~71 ops on GPU with expensive ANE<->GPU hops).
+            // Route offline to GPU; keep streaming (single/split encoder) on ANE.
+            // Only override the default so explicit callers are respected.
+            if config.modelLayout == .offlineEncoder,
+                mlConfiguration.computeUnits == .cpuAndNeuralEngine {
+                mlConfiguration.computeUnits = .cpuAndGPU
+                logger.info("Nemotron offline layout -> routing encoder to cpuAndGPU (ANE-hostile graph)")
+            }
         }
 
         // Load preprocessor
