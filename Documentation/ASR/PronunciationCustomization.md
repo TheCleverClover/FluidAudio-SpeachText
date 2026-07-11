@@ -4,8 +4,38 @@ FluidAudio includes an opt-in pronunciation customization path for adapting Para
 terms without retraining or recompiling the Core ML model. Applications enroll several recordings, store a compact
 prototype embedding, and compare that prototype with encoder windows from later transcriptions.
 
-This feature is experimental. It exposes the reusable FluidAudio primitives and a removable lab, but it does not
-automatically rewrite transcripts or persist a user's dictionary.
+FluidAudio exposes reusable primitives and a removable lab. It deliberately does not own application labels,
+persistence, UI, or automatic transcript rewriting. The application integration below is the production contract
+used by FluidVoice.
+
+## FluidVoice Production Contract
+
+FluidVoice exposes one default-off **Voice matching (Experimental)** toggle inside Train by Voice. The existing UI,
+recording loop, dictionary entries, and deterministic string replacement remain the source of truth.
+
+| Toggle | Enrollment | Final dictation |
+|---|---|---|
+| Off | Save decoded text variants only | Apply existing string replacements |
+| On | Save 3–10 acoustic embeddings and decoded text variants | Apply acoustic proposals first, then string replacements as fallback |
+
+The ordering is required. String replacement changes the decoded words before acoustic ranges are mapped back to
+them, so string-first can invalidate word ownership. Acoustic-first preserves Parakeet's original token timings;
+the deterministic pass then covers acoustic misses and old dictionary entries.
+
+Voice profiles are keyed by the stable dictionary entry UUID, Parakeet model version, and encoder hidden size. A
+profile is ignored rather than converted when the active model is incompatible. Deleting its dictionary entry also
+deletes its profile; editing the replacement keeps the UUID and updates the profile label.
+
+Operational requirements:
+
+- capture and matching must be guarded by the toggle and remain off by default;
+- at least three valid isolated enrollments are required, with a maximum of ten;
+- persistence must be versioned, atomic, local-only, and independent of `UserDefaults`;
+- matching failures must never fail transcription or prevent the string fallback;
+- logs record model, prototype count, score, selected word range, and elapsed time, but never audio or vector values;
+- ambiguous homophones are not auto-resolved acoustically;
+- one batched matcher call handles all prototypes; applications must not loop over prototypes;
+- accepted ranges are resolved by score and may not overlap.
 
 ## Architecture
 
@@ -75,7 +105,8 @@ When disabled:
 - normal TDT decoding and transcript output are unchanged.
 
 `consumePronunciationEncoderFeatures()` returns and clears the latest captured sequence. Consumers should call it
-after each transcription while the feature is enabled.
+after each transcription while the feature is enabled, including failure/fallback paths, so stale features cannot
+leak into the next request.
 
 ## Building and Storing Prototypes
 
@@ -142,6 +173,24 @@ The current exploratory defaults are:
 
 Applications should validate thresholds with positive and hard-negative recordings before shipping.
 
+## Acceptance and Rollout Gates
+
+Before promoting the FluidVoice toggle from experimental, test at least 20 target terms (names, uncommon technical
+terms, and multi-token decoder errors), with 3–10 enrollments per term. Each term needs at least 20 positive sentences
+and 50 hard negatives containing phonetically close common words. Report:
+
+- target recall and exact replacement accuracy;
+- false accepts per dictated hour and per hard-negative utterance;
+- word-span correctness, including adjacent-word capture;
+- p50/p95 matching latency at 1, 10, 50, and 100 profiles;
+- end-to-end dictation latency with the toggle on versus off;
+- model mismatch, missing/corrupt profile, delete, edit, and toggle-off fallback behavior.
+
+Go only if target recall is at least 90%, no accepted range captures an unrelated adjacent word, hard-negative false
+accepts are below 0.5%, and 100-profile matching adds no more than 10 ms p95 on the oldest supported Apple Silicon
+Mac. `Claude`/`cloud` and other true homophones must be excluded from acoustic accuracy claims and handled by the
+user's deterministic preference or a later contextual layer.
+
 ## Complexity and Measured Latency
 
 Matching is linear in the number of prototypes, not quadratic. Candidate window embeddings are built once per
@@ -186,8 +235,9 @@ range playback, replacement previews, and timing logs. Its session state is inte
 - Homophones such as `Claude` and `cloud` cannot be separated acoustically; context or user preference must decide.
 - A lower threshold improves recall and increases false positives, especially for names resembling common words.
 - Parakeet timings are quantized to 80 ms encoder frames, not sample-accurate forced alignment.
-- Capture currently represents one Parakeet model pass up to 15 seconds. Longer application recordings need the same
-  chunk ownership and merge discipline as the surrounding ASR pipeline.
+- Capture currently represents one Parakeet model pass up to 15 seconds. FluidVoice therefore skips acoustic matching
+  for longer recordings until FluidAudio exposes a merged encoder sequence with the same chunk ownership discipline
+  as the surrounding ASR pipeline; deterministic rules still run.
 - The API returns evidence and ranges. The application remains responsible for conflict resolution, text replacement,
   persistence, settings, and UI.
 
