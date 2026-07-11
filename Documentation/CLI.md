@@ -45,6 +45,10 @@ swift run fluidaudiocli qwen3-benchmark
 
 # CTC keyword spotting benchmark on Earnings22
 swift run fluidaudiocli ctc-earnings-benchmark
+
+# Benchmark 1–100 pronunciation prototypes with real Parakeet encoder features
+swift run -c release fluidaudiocli pronunciation-benchmark recording.wav \
+  --runs 30 --warmup-runs 5 --varied-prototype-frames
 ```
 
 ## Diarization

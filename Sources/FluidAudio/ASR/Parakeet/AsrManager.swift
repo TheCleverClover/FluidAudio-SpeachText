@@ -53,6 +53,10 @@ public actor AsrManager {
     internal var vocabSizeConfig: ContextBiasingConstants.VocabSizeConfig?
     internal var vocabBoostingEnabled: Bool { customVocabulary != nil && vocabularyRescorer != nil }
 
+    // Opt-in pronunciation customization. Disabled by default and only copied when explicitly enabled.
+    internal var pronunciationCustomizationEnabled = false
+    internal var lastPronunciationEncoderFeatures: EncoderFeatureSequence?
+
     // Cached prediction options for reuse
     internal lazy var predictionOptions: MLPredictionOptions = {
         AsrModels.optimizedPredictionOptions()

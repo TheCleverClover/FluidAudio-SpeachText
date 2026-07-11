@@ -39,6 +39,10 @@ struct FluidAudioCLI {
             await FLEURSBenchmark.runCLI(arguments: Array(arguments.dropFirst(2)))
         case "transcribe":
             await TranscribeCommand.run(arguments: Array(arguments.dropFirst(2)))
+        case "word-audio-probe":
+            await WordAudioProbeCommand.run(arguments: Array(arguments.dropFirst(2)))
+        case "pronunciation-benchmark":
+            await PronunciationBenchmarkCommand.run(arguments: Array(arguments.dropFirst(2)))
         case "multi-stream":
             await MultiStreamCommand.run(arguments: Array(arguments.dropFirst(2)))
         case "tts":
@@ -100,6 +104,9 @@ struct FluidAudioCLI {
                 asr-benchmark           Run ASR benchmark on LibriSpeech
                 fleurs-benchmark        Run multilingual ASR benchmark on FLEURS dataset
                 transcribe              Transcribe audio file using streaming ASR
+                word-audio-probe        Extract and play one transcribed word's audio span
+                pronunciation-benchmark
+                                        Benchmark pronunciation matching with up to 100 prototypes
                 multi-stream            Transcribe multiple audio files in parallel
                 tts                     Synthesize speech from text using Kokoro TTS
                 parakeet-eou            Run Parakeet EOU Streaming ASR on a single file

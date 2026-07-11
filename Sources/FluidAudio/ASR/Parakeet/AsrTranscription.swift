@@ -154,6 +154,14 @@ extension AsrManager {
             let actualFrames =
                 actualAudioFrames ?? ASRConstants.calculateEncoderFrames(from: originalLength ?? paddedAudio.count)
 
+            try capturePronunciationEncoderFeaturesIfEnabled(
+                rawEncoderOutput,
+                encoderSequenceLength: encoderSequenceLength,
+                actualAudioFrames: actualFrames,
+                contextFrameAdjustment: contextFrameAdjustment,
+                globalFrameOffset: globalFrameOffset
+            )
+
             let hypothesis = try await tdtDecodeWithTimings(
                 encoderOutput: rawEncoderOutput,
                 encoderSequenceLength: encoderSequenceLength,

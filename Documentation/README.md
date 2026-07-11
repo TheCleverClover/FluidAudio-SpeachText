@@ -9,6 +9,7 @@
 - [Getting Started](ASR/GettingStarted.md)
 - [Post-Processing (ITN)](ASR/PostProcessing.md)
 - [Custom Vocabulary](ASR/CustomVocabulary.md)
+- [On-Device Pronunciation Customization](ASR/PronunciationCustomization.md)
 - [Custom Pronunciation](ASR/CustomPronunciation.md)
 - [Last Chunk Handling](ASR/LastChunkHandling.md)
 - [Manual Model Loading](ASR/ManualModelLoading.md)
