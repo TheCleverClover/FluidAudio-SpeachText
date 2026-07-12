@@ -490,22 +490,27 @@ public class DownloadUtils {
         request: URLRequest,
         onProgress: @escaping @Sendable (Int64, Int64) -> Void
     ) async throws -> (URL, HTTPURLResponse) {
-        let delegate = DownloadProgressDelegate(onProgress: onProgress)
-        // Dedicated session with delegate — one per download to avoid cross-talk.
-        let session = URLSession(
-            configuration: sharedSession.configuration,
-            delegate: delegate,
-            delegateQueue: nil
-        )
-        defer { session.finishTasksAndInvalidate() }
+        let taskHolder = DownloadTaskHolder()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let delegate = DownloadProgressDelegate(
+                    onProgress: onProgress,
+                    completion: { continuation.resume(with: $0) }
+                )
+                let session = URLSession(
+                    configuration: sharedSession.configuration,
+                    delegate: delegate,
+                    delegateQueue: nil
+                )
+                delegate.session = session
 
-        let (tempURL, response) = try await session.download(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw HuggingFaceDownloadError.invalidResponse
+                let task = session.downloadTask(with: request)
+                taskHolder.setTask(task)
+                task.resume()
+            }
+        } onCancel: {
+            taskHolder.cancel()
         }
-
-        return (tempURL, httpResponse)
     }
 
     /// Download a specific subdirectory from a HuggingFace repository.
@@ -661,12 +666,46 @@ public class DownloadUtils {
 
 // MARK: - URLSession download delegate for byte-level progress
 
-/// Lightweight delegate that forwards `didWriteData` callbacks to a closure.
-private final class DownloadProgressDelegate: NSObject, URLSessionDownloadDelegate, Sendable {
-    private let onProgress: @Sendable (Int64, Int64) -> Void
+private final class DownloadTaskHolder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: URLSessionDownloadTask?
+    private var isCancelled = false
 
-    init(onProgress: @escaping @Sendable (Int64, Int64) -> Void) {
+    func setTask(_ task: URLSessionDownloadTask) {
+        lock.withLock {
+            if self.isCancelled {
+                task.cancel()
+            } else {
+                self.task = task
+            }
+        }
+    }
+
+    func cancel() {
+        lock.withLock {
+            self.isCancelled = true
+            self.task?.cancel()
+        }
+    }
+}
+
+/// Delegate-backed downloads are required for continuous `didWriteData` events.
+/// Foundation's async download convenience only surfaced file-completion updates here.
+private final class DownloadProgressDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    typealias Completion = @Sendable (Result<(URL, HTTPURLResponse), Error>) -> Void
+
+    private let onProgress: @Sendable (Int64, Int64) -> Void
+    private let lock = NSLock()
+    private var completion: Completion?
+    private var downloadResult: Result<(URL, HTTPURLResponse), Error>?
+    weak var session: URLSession?
+
+    init(
+        onProgress: @escaping @Sendable (Int64, Int64) -> Void,
+        completion: @escaping Completion
+    ) {
         self.onProgress = onProgress
+        self.completion = completion
     }
 
     func urlSession(
@@ -684,6 +723,46 @@ private final class DownloadProgressDelegate: NSObject, URLSessionDownloadDelega
         downloadTask: URLSessionDownloadTask,
         didFinishDownloadingTo location: URL
     ) {
-        // Required by protocol — the async download(for:) API handles the file.
+        guard let response = downloadTask.response as? HTTPURLResponse else {
+            storeResult(.failure(DownloadUtils.HuggingFaceDownloadError.invalidResponse))
+            return
+        }
+
+        do {
+            let retainedURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("FluidAudioDownload-\(UUID().uuidString)")
+            try FileManager.default.copyItem(at: location, to: retainedURL)
+            storeResult(.success((retainedURL, response)))
+        } catch {
+            storeResult(.failure(error))
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: Error?
+    ) {
+        if let error {
+            finish(.failure(error))
+        } else {
+            let result = lock.withLock { self.downloadResult }
+            finish(result ?? .failure(DownloadUtils.HuggingFaceDownloadError.invalidResponse))
+        }
+        self.session?.finishTasksAndInvalidate()
+    }
+
+    private func storeResult(_ result: Result<(URL, HTTPURLResponse), Error>) {
+        lock.withLock {
+            self.downloadResult = result
+        }
+    }
+
+    private func finish(_ result: Result<(URL, HTTPURLResponse), Error>) {
+        let completion = lock.withLock { () -> Completion? in
+            defer { self.completion = nil }
+            return self.completion
+        }
+        completion?(result)
     }
 }
