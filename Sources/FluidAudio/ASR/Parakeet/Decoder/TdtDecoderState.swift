@@ -97,9 +97,28 @@ struct TdtDecoderState: Sendable {
 
 extension MLMultiArray {
     func resetData(to value: NSNumber) {
+        if dataType == .float32, hasContiguousStorage {
+            dataPointer
+                .bindMemory(to: Float.self, capacity: count)
+                .update(repeating: value.floatValue, count: count)
+            return
+        }
+
         for i in 0..<count {
             self[i] = value
         }
+    }
+
+    private var hasContiguousStorage: Bool {
+        let dimensions = shape.map(\.intValue)
+        let elementStrides = strides.map(\.intValue)
+        var expectedStride = 1
+
+        for axis in dimensions.indices.reversed() {
+            guard elementStrides[axis] == expectedStride else { return false }
+            expectedStride *= dimensions[axis]
+        }
+        return true
     }
 
     func copyData(from source: MLMultiArray) {
