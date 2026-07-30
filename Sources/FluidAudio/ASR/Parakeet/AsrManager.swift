@@ -18,6 +18,7 @@ public actor AsrManager {
     internal var encoderModel: MLModel?
     internal var decoderModel: MLModel?
     internal var jointModel: MLModel?
+    internal var preparedParakeetPreprocessorOutputs: [UUID: ParakeetPreprocessorOutput] = [:]
 
     /// The AsrModels instance if initialized with models
     internal var asrModels: AsrModels?

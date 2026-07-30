@@ -28,6 +28,33 @@ final class ChunkProcessorTests: XCTestCase {
         XCTAssertNotNil(processor)
     }
 
+    func testFrontendPipeliningDefaultsOnForSplitFrontend() {
+        XCTAssertTrue(
+            ChunkProcessor.shouldPipelineFrontend(
+                environmentMode: nil,
+                supportsPipelining: true
+            )
+        )
+    }
+
+    func testFrontendPipeliningCanBeDisabledForBenchmarkFallback() {
+        XCTAssertFalse(
+            ChunkProcessor.shouldPipelineFrontend(
+                environmentMode: "serial",
+                supportsPipelining: true
+            )
+        )
+    }
+
+    func testFrontendPipeliningStaysOffForFusedFrontend() {
+        XCTAssertFalse(
+            ChunkProcessor.shouldPipelineFrontend(
+                environmentMode: nil,
+                supportsPipelining: false
+            )
+        )
+    }
+
     // MARK: - Audio Duration Calculations
 
     func testLongAudioChunking() {

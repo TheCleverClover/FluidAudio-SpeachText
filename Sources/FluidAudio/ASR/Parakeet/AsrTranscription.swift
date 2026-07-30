@@ -2,7 +2,20 @@
 import Foundation
 import OSLog
 
+struct PreparedParakeetPreprocessorHandle: Hashable, Sendable {
+    let id: UUID
+}
+
+struct ParakeetPreprocessorOutput {
+    let input: MLFeatureProvider
+    let output: MLFeatureProvider
+    let audioArray: MLMultiArray?
+}
+
 extension AsrManager {
+    func supportsParakeetFrontendPipelining() -> Bool {
+        encoderModel != nil
+    }
 
     internal func transcribeWithState(
         _ audioSamples: [Float], source: AudioSource
@@ -97,7 +110,7 @@ extension AsrManager {
         return result
     }
 
-    internal func executeMLInferenceWithTimings(
+    func executeMLInferenceWithTimings(
         _ paddedAudio: [Float],
         originalLength: Int? = nil,
         actualAudioFrames: Int? = nil,
@@ -106,9 +119,29 @@ extension AsrManager {
         isLastChunk: Bool = false,
         globalFrameOffset: Int = 0
     ) async throws -> (hypothesis: TdtHypothesis, encoderSequenceLength: Int) {
+        let preparedOutput = try await prepareParakeetPreprocessorOutput(
+            paddedAudio,
+            originalLength: originalLength
+        )
+        return try await executeMLInferenceWithTimings(
+            preparedOutput: preparedOutput,
+            paddedAudio: paddedAudio,
+            originalLength: originalLength,
+            actualAudioFrames: actualAudioFrames,
+            decoderState: &decoderState,
+            contextFrameAdjustment: contextFrameAdjustment,
+            isLastChunk: isLastChunk,
+            globalFrameOffset: globalFrameOffset
+        )
+    }
 
+    func prepareParakeetPreprocessorOutput(
+        _ paddedAudio: [Float],
+        originalLength: Int?
+    ) async throws -> PreparedParakeetPreprocessorHandle {
         let preprocessorInput = try await preparePreprocessorInput(
-            paddedAudio, actualLength: originalLength)
+            paddedAudio, actualLength: originalLength
+        )
 
         let preprocessorAudioArray = preprocessorInput.featureValue(for: "audio_signal")?.multiArrayValue
 
@@ -123,13 +156,43 @@ extension AsrManager {
                 options: predictionOptions
             )
 
+            let handle = PreparedParakeetPreprocessorHandle(id: UUID())
+            preparedParakeetPreprocessorOutputs[handle.id] = ParakeetPreprocessorOutput(
+                input: preprocessorInput,
+                output: preprocessorOutput,
+                audioArray: preprocessorAudioArray
+            )
+            return handle
+        } catch {
+            if let preprocessorAudioArray {
+                await sharedMLArrayCache.returnArray(preprocessorAudioArray)
+            }
+            throw error
+        }
+    }
+
+    func executeMLInferenceWithTimings(
+        preparedOutput handle: PreparedParakeetPreprocessorHandle,
+        paddedAudio: [Float],
+        originalLength: Int?,
+        actualAudioFrames: Int?,
+        decoderState: inout TdtDecoderState,
+        contextFrameAdjustment: Int,
+        isLastChunk: Bool,
+        globalFrameOffset: Int
+    ) async throws -> (hypothesis: TdtHypothesis, encoderSequenceLength: Int) {
+        guard let preparedOutput = preparedParakeetPreprocessorOutputs.removeValue(forKey: handle.id) else {
+            throw ASRError.processingFailed("Prepared preprocessor output is unavailable")
+        }
+
+        do {
             let encoderOutputProvider: MLFeatureProvider
             if let encoderModel = encoderModel {
                 // Split frontend: run separate encoder
                 let encoderInput = try prepareEncoderInput(
                     encoder: encoderModel,
-                    preprocessorOutput: preprocessorOutput,
-                    originalInput: preprocessorInput
+                    preprocessorOutput: preparedOutput.output,
+                    originalInput: preparedOutput.input
                 )
 
                 try Task.checkCancellation()
@@ -139,14 +202,16 @@ extension AsrManager {
                 )
             } else {
                 // Fused frontend: preprocessor output already contains encoder features
-                encoderOutputProvider = preprocessorOutput
+                encoderOutputProvider = preparedOutput.output
             }
 
             let rawEncoderOutput = try extractFeatureValue(
-                from: encoderOutputProvider, key: "encoder", errorMessage: "Invalid encoder output")
+                from: encoderOutputProvider, key: "encoder", errorMessage: "Invalid encoder output"
+            )
             let encoderLength = try extractFeatureValue(
                 from: encoderOutputProvider, key: "encoder_length",
-                errorMessage: "Invalid encoder output length")
+                errorMessage: "Invalid encoder output length"
+            )
 
             let encoderSequenceLength = encoderLength[0].intValue
 
@@ -173,17 +238,26 @@ extension AsrManager {
                 globalFrameOffset: globalFrameOffset
             )
 
-            if let preprocessorAudioArray {
+            if let preprocessorAudioArray = preparedOutput.audioArray {
                 await sharedMLArrayCache.returnArray(preprocessorAudioArray)
             }
 
             return (hypothesis, encoderSequenceLength)
         } catch {
-            if let preprocessorAudioArray {
+            if let preprocessorAudioArray = preparedOutput.audioArray {
                 await sharedMLArrayCache.returnArray(preprocessorAudioArray)
             }
             throw error
         }
+    }
+
+    func discardParakeetPreprocessorOutput(_ handle: PreparedParakeetPreprocessorHandle) async {
+        guard let preparedOutput = preparedParakeetPreprocessorOutputs.removeValue(forKey: handle.id),
+            let audioArray = preparedOutput.audioArray
+        else {
+            return
+        }
+        await sharedMLArrayCache.returnArray(audioArray)
     }
 
     private func prepareEncoderInput(
@@ -286,7 +360,9 @@ extension AsrManager {
             return (deduped, adjustedTimestamps, adjustedConfidences, adjustedDurations, encLen)
         }
 
-        return (hypothesis.ySequence, hypothesis.timestamps, hypothesis.tokenConfidences, hypothesis.tokenDurations, encLen)
+        return (
+            hypothesis.ySequence, hypothesis.timestamps, hypothesis.tokenConfidences, hypothesis.tokenDurations, encLen
+        )
     }
 
     internal func processTranscriptionResult(
