@@ -19,6 +19,7 @@ public actor AsrManager {
     internal var decoderModel: MLModel?
     internal var jointModel: MLModel?
     internal var preparedParakeetPreprocessorOutputs: [UUID: ParakeetPreprocessorOutput] = [:]
+    internal var preparedParakeetEncoderOutputs: [UUID: ParakeetEncoderOutput] = [:]
 
     /// The AsrModels instance if initialized with models
     internal var asrModels: AsrModels?
@@ -324,6 +325,8 @@ public actor AsrManager {
         encoderModel = nil
         decoderModel = nil
         jointModel = nil
+        preparedParakeetPreprocessorOutputs.removeAll()
+        preparedParakeetEncoderOutputs.removeAll()
         // Reset decoder states using fresh allocations for deterministic behavior
         microphoneDecoderState = TdtDecoderState.make(decoderLayers: layers)
         systemDecoderState = TdtDecoderState.make(decoderLayers: layers)

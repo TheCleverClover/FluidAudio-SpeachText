@@ -6,10 +6,18 @@ struct PreparedParakeetPreprocessorHandle: Hashable, Sendable {
     let id: UUID
 }
 
+struct PreparedParakeetEncoderHandle: Hashable, Sendable {
+    let id: UUID
+}
+
 struct ParakeetPreprocessorOutput {
     let input: MLFeatureProvider
     let output: MLFeatureProvider
     let audioArray: MLMultiArray?
+}
+
+struct ParakeetEncoderOutput {
+    let encoderOutput: MLFeatureProvider
 }
 
 extension AsrManager {
@@ -119,12 +127,15 @@ extension AsrManager {
         isLastChunk: Bool = false,
         globalFrameOffset: Int = 0
     ) async throws -> (hypothesis: TdtHypothesis, encoderSequenceLength: Int) {
-        let preparedOutput = try await prepareParakeetPreprocessorOutput(
+        let preparedPreprocessor = try await prepareParakeetPreprocessorOutput(
             paddedAudio,
             originalLength: originalLength
         )
+        let preparedEncoder = try await prepareParakeetEncoderOutput(
+            preparedPreprocessor: preparedPreprocessor
+        )
         return try await executeMLInferenceWithTimings(
-            preparedOutput: preparedOutput,
+            preparedEncoder: preparedEncoder,
             paddedAudio: paddedAudio,
             originalLength: originalLength,
             actualAudioFrames: actualAudioFrames,
@@ -171,24 +182,16 @@ extension AsrManager {
         }
     }
 
-    func executeMLInferenceWithTimings(
-        preparedOutput handle: PreparedParakeetPreprocessorHandle,
-        paddedAudio: [Float],
-        originalLength: Int?,
-        actualAudioFrames: Int?,
-        decoderState: inout TdtDecoderState,
-        contextFrameAdjustment: Int,
-        isLastChunk: Bool,
-        globalFrameOffset: Int
-    ) async throws -> (hypothesis: TdtHypothesis, encoderSequenceLength: Int) {
+    func prepareParakeetEncoderOutput(
+        preparedPreprocessor handle: PreparedParakeetPreprocessorHandle
+    ) async throws -> PreparedParakeetEncoderHandle {
         guard let preparedOutput = preparedParakeetPreprocessorOutputs.removeValue(forKey: handle.id) else {
             throw ASRError.processingFailed("Prepared preprocessor output is unavailable")
         }
 
         do {
             let encoderOutputProvider: MLFeatureProvider
-            if let encoderModel = encoderModel {
-                // Split frontend: run separate encoder
+            if let encoderModel {
                 let encoderInput = try prepareEncoderInput(
                     encoder: encoderModel,
                     preprocessorOutput: preparedOutput.output,
@@ -201,15 +204,46 @@ extension AsrManager {
                     options: predictionOptions
                 )
             } else {
-                // Fused frontend: preprocessor output already contains encoder features
                 encoderOutputProvider = preparedOutput.output
             }
 
+            if let preprocessorAudioArray = preparedOutput.audioArray {
+                await sharedMLArrayCache.returnArray(preprocessorAudioArray)
+            }
+
+            let encoderHandle = PreparedParakeetEncoderHandle(id: UUID())
+            preparedParakeetEncoderOutputs[encoderHandle.id] = ParakeetEncoderOutput(
+                encoderOutput: encoderOutputProvider
+            )
+            return encoderHandle
+        } catch {
+            if let preprocessorAudioArray = preparedOutput.audioArray {
+                await sharedMLArrayCache.returnArray(preprocessorAudioArray)
+            }
+            throw error
+        }
+    }
+
+    func executeMLInferenceWithTimings(
+        preparedEncoder handle: PreparedParakeetEncoderHandle,
+        paddedAudio: [Float],
+        originalLength: Int?,
+        actualAudioFrames: Int?,
+        decoderState: inout TdtDecoderState,
+        contextFrameAdjustment: Int,
+        isLastChunk: Bool,
+        globalFrameOffset: Int
+    ) async throws -> (hypothesis: TdtHypothesis, encoderSequenceLength: Int) {
+        guard let preparedOutput = preparedParakeetEncoderOutputs.removeValue(forKey: handle.id) else {
+            throw ASRError.processingFailed("Prepared encoder output is unavailable")
+        }
+
+        do {
             let rawEncoderOutput = try extractFeatureValue(
-                from: encoderOutputProvider, key: "encoder", errorMessage: "Invalid encoder output"
+                from: preparedOutput.encoderOutput, key: "encoder", errorMessage: "Invalid encoder output"
             )
             let encoderLength = try extractFeatureValue(
-                from: encoderOutputProvider, key: "encoder_length",
+                from: preparedOutput.encoderOutput, key: "encoder_length",
                 errorMessage: "Invalid encoder output length"
             )
 
@@ -238,16 +272,7 @@ extension AsrManager {
                 globalFrameOffset: globalFrameOffset
             )
 
-            if let preprocessorAudioArray = preparedOutput.audioArray {
-                await sharedMLArrayCache.returnArray(preprocessorAudioArray)
-            }
-
             return (hypothesis, encoderSequenceLength)
-        } catch {
-            if let preprocessorAudioArray = preparedOutput.audioArray {
-                await sharedMLArrayCache.returnArray(preprocessorAudioArray)
-            }
-            throw error
         }
     }
 
@@ -258,6 +283,10 @@ extension AsrManager {
             return
         }
         await sharedMLArrayCache.returnArray(audioArray)
+    }
+
+    func discardParakeetEncoderOutput(_ handle: PreparedParakeetEncoderHandle) {
+        preparedParakeetEncoderOutputs.removeValue(forKey: handle.id)
     }
 
     private func prepareEncoderInput(

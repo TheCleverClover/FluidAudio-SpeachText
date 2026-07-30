@@ -126,6 +126,22 @@ struct ChunkProcessor {
         pipeliningEnabled: Bool,
         progressHandler: ((Double) async -> Void)?
     ) async throws -> [[TokenWindow]] {
+        if pipeliningEnabled {
+            return try await processChunksPipelined(
+                using: manager,
+                progressHandler: progressHandler
+            )
+        }
+        return try await processChunksSerial(
+            using: manager,
+            progressHandler: progressHandler
+        )
+    }
+
+    private func processChunksSerial(
+        using manager: AsrManager,
+        progressHandler: ((Double) async -> Void)?
+    ) async throws -> [[TokenWindow]] {
         guard var currentWork = try makeChunkWork(chunkStart: 0, chunkIndex: 0) else {
             return []
         }
@@ -135,50 +151,42 @@ struct ChunkProcessor {
         var chunkDecoderState = TdtDecoderState.make(
             decoderLayers: await manager.getDecoderLayers()
         )
-        var currentPreprocessorTask =
-            pipeliningEnabled ? makePreprocessorTask(for: currentWork, using: manager) : nil
 
         while true {
-            var preparedOutput: PreparedParakeetPreprocessorHandle?
-            var nextWork: ChunkWork?
-            var nextPreprocessorTask: Task<PreparedParakeetPreprocessorHandle, Error>?
+            var preparedPreprocessor: PreparedParakeetPreprocessorHandle?
+            var preparedEncoder: PreparedParakeetEncoderHandle?
             do {
                 try Task.checkCancellation()
-                if let currentPreprocessorTask {
-                    preparedOutput = try await currentPreprocessorTask.value
-                } else {
-                    preparedOutput = try await manager.prepareParakeetPreprocessorOutput(
-                        currentWork.paddedSamples,
-                        originalLength: currentWork.samples.count
-                    )
-                }
-
-                if !currentWork.isLastChunk {
-                    nextWork = try makeChunkWork(
-                        chunkStart: currentWork.chunkStart + strideSamples,
-                        chunkIndex: chunkIndex + 1
-                    )
-                    nextPreprocessorTask =
-                        pipeliningEnabled ? nextWork.map { makePreprocessorTask(for: $0, using: manager) } : nil
-                }
-
-                guard let preparedOutput else {
+                preparedPreprocessor = try await manager.prepareParakeetPreprocessorOutput(
+                    currentWork.paddedSamples,
+                    originalLength: currentWork.samples.count
+                )
+                guard let preprocessorToEncode = preparedPreprocessor else {
                     throw ASRError.processingFailed("Preprocessor output was not prepared")
+                }
+                preparedEncoder = try await manager.prepareParakeetEncoderOutput(
+                    preparedPreprocessor: preprocessorToEncode
+                )
+                preparedPreprocessor = nil
+                guard let encoderToDecode = preparedEncoder else {
+                    throw ASRError.processingFailed("Encoder output was not prepared")
                 }
                 chunkDecoderState.reset()
                 let output = try await transcribeChunk(
                     work: currentWork,
-                    preparedOutput: preparedOutput,
+                    preparedEncoder: encoderToDecode,
                     using: manager,
                     decoderState: &chunkDecoderState
                 )
+                preparedEncoder = nil
                 chunkOutputs.append(try makeTokenWindow(from: output))
             } catch {
-                if let preparedOutput {
-                    await manager.discardParakeetPreprocessorOutput(preparedOutput)
+                if let preparedPreprocessor {
+                    await manager.discardParakeetPreprocessorOutput(preparedPreprocessor)
                 }
-                await discardPreprocessorTask(currentPreprocessorTask, using: manager)
-                await discardPreprocessorTask(nextPreprocessorTask, using: manager)
+                if let preparedEncoder {
+                    await manager.discardParakeetEncoderOutput(preparedEncoder)
+                }
                 throw error
             }
 
@@ -191,11 +199,142 @@ struct ChunkProcessor {
                 await progressHandler(progress)
             }
 
-            guard let nextWork else {
+            guard
+                let nextWork = try makeChunkWork(
+                    chunkStart: currentWork.chunkStart + strideSamples,
+                    chunkIndex: chunkIndex + 1
+                )
+            else {
                 break
             }
             currentWork = nextWork
-            currentPreprocessorTask = nextPreprocessorTask
+            chunkIndex += 1
+        }
+
+        return chunkOutputs
+    }
+
+    private func processChunksPipelined(
+        using manager: AsrManager,
+        progressHandler: ((Double) async -> Void)?
+    ) async throws -> [[TokenWindow]] {
+        guard var currentWork = try makeChunkWork(chunkStart: 0, chunkIndex: 0) else {
+            return []
+        }
+
+        var chunkOutputs: [[TokenWindow]] = []
+        var chunkIndex = 0
+        var chunkDecoderState = TdtDecoderState.make(
+            decoderLayers: await manager.getDecoderLayers()
+        )
+        var currentEncoderTask: Task<PreparedParakeetEncoderHandle, Error>?
+        var lookaheadWork: ChunkWork?
+        var lookaheadPreprocessorTask: Task<PreparedParakeetPreprocessorHandle, Error>?
+
+        while true {
+            var currentEncoder: PreparedParakeetEncoderHandle?
+            var initialPreprocessor: PreparedParakeetPreprocessorHandle?
+            var lookaheadPreprocessor: PreparedParakeetPreprocessorHandle?
+            var followingWork: ChunkWork?
+            var followingPreprocessorTask: Task<PreparedParakeetPreprocessorHandle, Error>?
+            var nextEncoderTask: Task<PreparedParakeetEncoderHandle, Error>?
+
+            do {
+                try Task.checkCancellation()
+                if let currentEncoderTask {
+                    currentEncoder = try await currentEncoderTask.value
+                } else {
+                    initialPreprocessor = try await manager.prepareParakeetPreprocessorOutput(
+                        currentWork.paddedSamples,
+                        originalLength: currentWork.samples.count
+                    )
+                    if !currentWork.isLastChunk {
+                        lookaheadWork = try makeChunkWork(
+                            chunkStart: currentWork.chunkStart + strideSamples,
+                            chunkIndex: chunkIndex + 1
+                        )
+                        lookaheadPreprocessorTask =
+                            lookaheadWork.map { makePreprocessorTask(for: $0, using: manager) }
+                    }
+                    guard let initialPreprocessorHandle = initialPreprocessor else {
+                        throw ASRError.processingFailed("Initial preprocessor output was not prepared")
+                    }
+                    currentEncoder = try await manager.prepareParakeetEncoderOutput(
+                        preparedPreprocessor: initialPreprocessorHandle
+                    )
+                    initialPreprocessor = nil
+                }
+
+                if let lookaheadWork {
+                    guard let lookaheadPreprocessorTask else {
+                        throw ASRError.processingFailed("Lookahead preprocessor task is unavailable")
+                    }
+                    lookaheadPreprocessor = try await lookaheadPreprocessorTask.value
+
+                    if !lookaheadWork.isLastChunk {
+                        followingWork = try makeChunkWork(
+                            chunkStart: lookaheadWork.chunkStart + strideSamples,
+                            chunkIndex: chunkIndex + 2
+                        )
+                        followingPreprocessorTask =
+                            followingWork.map { makePreprocessorTask(for: $0, using: manager) }
+                    }
+
+                    guard let lookaheadPreprocessorHandle = lookaheadPreprocessor else {
+                        throw ASRError.processingFailed("Lookahead preprocessor output was not prepared")
+                    }
+                    nextEncoderTask = makeEncoderTask(
+                        for: lookaheadPreprocessorHandle,
+                        using: manager
+                    )
+                    lookaheadPreprocessor = nil
+                }
+
+                guard let encoderToDecode = currentEncoder else {
+                    throw ASRError.processingFailed("Encoder output was not prepared")
+                }
+                chunkDecoderState.reset()
+                let output = try await transcribeChunk(
+                    work: currentWork,
+                    preparedEncoder: encoderToDecode,
+                    using: manager,
+                    decoderState: &chunkDecoderState
+                )
+                currentEncoder = nil
+                chunkOutputs.append(try makeTokenWindow(from: output))
+            } catch {
+                if let initialPreprocessor {
+                    await manager.discardParakeetPreprocessorOutput(initialPreprocessor)
+                }
+                if let lookaheadPreprocessor {
+                    await manager.discardParakeetPreprocessorOutput(lookaheadPreprocessor)
+                }
+                if let currentEncoder {
+                    await manager.discardParakeetEncoderOutput(currentEncoder)
+                }
+                await discardPreprocessorTask(lookaheadPreprocessorTask, using: manager)
+                await discardPreprocessorTask(followingPreprocessorTask, using: manager)
+                await discardEncoderTask(currentEncoderTask, using: manager)
+                await discardEncoderTask(nextEncoderTask, using: manager)
+                throw error
+            }
+
+            if currentWork.isLastChunk {
+                break
+            }
+
+            if let progressHandler {
+                let progress = min(1.0, max(0.0, Double(currentWork.chunkEnd) / Double(totalSamples)))
+                await progressHandler(progress)
+            }
+
+            guard let nextWork = lookaheadWork else {
+                break
+            }
+            currentWork = nextWork
+            currentEncoderTask = nextEncoderTask
+            lookaheadWork = followingWork
+            lookaheadPreprocessorTask = followingPreprocessorTask
             chunkIndex += 1
         }
 
@@ -252,6 +391,29 @@ struct ChunkProcessor {
         }
     }
 
+    private func makeEncoderTask(
+        for preparedPreprocessor: PreparedParakeetPreprocessorHandle,
+        using manager: AsrManager
+    ) -> Task<PreparedParakeetEncoderHandle, Error> {
+        Task {
+            await Task.yield()
+            return try await manager.prepareParakeetEncoderOutput(
+                preparedPreprocessor: preparedPreprocessor
+            )
+        }
+    }
+
+    private func discardEncoderTask(
+        _ task: Task<PreparedParakeetEncoderHandle, Error>?,
+        using manager: AsrManager
+    ) async {
+        guard let task else { return }
+        task.cancel()
+        if let handle = try? await task.value {
+            await manager.discardParakeetEncoderOutput(handle)
+        }
+    }
+
     private func makeTokenWindow(
         from output: (tokens: [Int], timestamps: [Int], confidences: [Float], durations: [Int])
     ) throws -> [TokenWindow] {
@@ -281,7 +443,7 @@ struct ChunkProcessor {
 
     private func transcribeChunk(
         work: ChunkWork,
-        preparedOutput: PreparedParakeetPreprocessorHandle,
+        preparedEncoder: PreparedParakeetEncoderHandle,
         using manager: AsrManager,
         decoderState: inout TdtDecoderState
     ) async throws -> (tokens: [Int], timestamps: [Int], confidences: [Float], durations: [Int]) {
@@ -291,7 +453,7 @@ struct ChunkProcessor {
         let contextFrames = work.contextSamples / ASRConstants.samplesPerEncoderFrame
 
         let (hypothesis, encoderSequenceLength) = try await manager.executeMLInferenceWithTimings(
-            preparedOutput: preparedOutput,
+            preparedEncoder: preparedEncoder,
             paddedAudio: work.paddedSamples,
             originalLength: work.samples.count,
             actualAudioFrames: actualFrameCount,
