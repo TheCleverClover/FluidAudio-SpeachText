@@ -119,7 +119,7 @@ public final class GraniteTokenizer {
 }
 
 @available(macOS 14, iOS 17, *)
-public struct GraniteAsrModels {
+public struct GraniteAsrModels: @unchecked Sendable {
     public static let manifestFile = "granite_manifest.json"
 
     public let balancedModel: MLModel

@@ -70,7 +70,7 @@ public struct GranitePlusManifest: Codable, Sendable {
 }
 
 @available(macOS 15, iOS 18, *)
-public struct GranitePlusAsrModels {
+public struct GranitePlusAsrModels: @unchecked Sendable {
     public static let manifestFile = "granite_plus_manifest.json"
 
     public let audioModel: MLModel
