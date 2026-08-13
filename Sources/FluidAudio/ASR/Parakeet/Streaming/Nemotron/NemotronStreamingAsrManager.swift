@@ -422,8 +422,6 @@ public actor NemotronStreamingAsrManager {
     private nonisolated func zeroArray(_ array: MLMultiArray) {
         let bytesPerElement: Int
         switch array.dataType {
-        case .int8:
-            bytesPerElement = MemoryLayout<Int8>.stride
         case .float16:
             bytesPerElement = MemoryLayout<UInt16>.stride
         case .float32, .int32:
